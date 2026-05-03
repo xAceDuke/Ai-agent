@@ -460,7 +460,28 @@ def scrape_article_content(url: str) -> Optional[str]:
 # ─── Cerebras AI Rewriter ─────────────────────────────────────────────────────
 
 AI_MODEL = "qwen-3-235b-a22b-instruct-2507"
+FILTER_MODEL = "llama3.1-8b"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
+
+PRE_FILTER_PROMPT = """Analyze this article and determine if it is a timely factual news event or a general interest article/feature.
+
+Criteria for 'is_news: true':
+- Timely reporting on a specific event that just occurred or is official.
+- Government announcements, policy releases, or legal rulings.
+- Geopolitical developments, disasters, or major factual events.
+
+Criteria for 'is_news: false':
+- Speculative analysis, opinions, editorials, or "what if" scenarios.
+- Lifestyle, advice, listicles, or soft interest features.
+- Content that does not report on a specific, recent factual occurrence.
+
+Return ONLY a JSON object:
+{{
+  "is_news": boolean,
+  "category": "india" or "international",
+  "reason": "One sentence explanation"
+}}
+"""
 
 class AIKeyManager:
     """Manages a pool of Cerebras API keys with intelligent rotation."""
@@ -501,6 +522,33 @@ class AIKeyManager:
         """Mark a key as exhausted for the day."""
         self.exhausted.add(index)
         log.error(f"[KEY-MANAGER] Key #{index} EXHAUSTED for the day.")
+
+def pre_filter_article(key_manager: AIKeyManager, title: str, content: str) -> Optional[dict]:
+    """
+    Perform quick pre-filtering using a smaller model to save Qwen usage.
+    Determines category and whether the article is hard news.
+    """
+    prompt = f"Title: {title}\n\nContent: {content[:2000]}" # Truncate for pre-filter
+    
+    client, key_idx = key_manager.get_client()
+    try:
+        response = client.chat.completions.create(
+            model=FILTER_MODEL,
+            messages=[
+                {"role": "system", "content": PRE_FILTER_PROMPT},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1, # Lower temperature for classification
+            response_format={"type": "json_object"},
+        )
+        raw_text = response.choices[0].message.content
+        result = json.loads(raw_text)
+        log.info(f"   [FILTER] model={FILTER_MODEL} is_news={result.get('is_news')} cat={result.get('category')} reason={result.get('reason')}")
+        return result
+    except Exception as e:
+        log.warning(f"   [WARN] Pre-filter failed ({e}). Proceeding to Qwen for safety.")
+        return None
+
 
 def init_ai() -> AIKeyManager:
     """Initialize Cerebras Key Manager with keys from .env."""
@@ -720,8 +768,24 @@ def process_cycle(key_manager: AIKeyManager, sb: Client, tracker: URLTracker) ->
                 continue
             log.info("   [INFO] Using RSS description as fallback content")
 
-        # Step 2: Rewrite with AI
+        # Step 2: Pre-filter with smaller model
+        filter_result = pre_filter_article(key_manager, article["title"], content)
+        
+        if filter_result:
+            # Early exit for non-news
+            if not filter_result.get("is_news", True):
+                log.info(f"   [IGNORE] Non-news detected by pre-filter. Skipping...")
+                save_ignored_article_supabase(sb, article, {"thought_process": filter_result.get("reason", "")})
+                tracker.mark_visited(article["url"])
+                continue
+            
+            # Apply AI-determined category early
+            article["category"] = filter_result.get("category", "india")
+
+        # Step 3: Rewrite with high-quality AI (Qwen)
         rewritten = rewrite_article(key_manager, article["title"], content)
+        
+        # Step 4: Final checks and processing
 
         if not rewritten:
             log.warning("   [SKIP] Rewrite failed")
