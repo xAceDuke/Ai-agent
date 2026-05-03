@@ -1,20 +1,20 @@
 """
-AirNews AI Agent (V7.0 - Multi-Source Hard News Edition)
+AirNews AI Agent (V8.0 - Cerebras Migration)
 ========================================================
 Fetches RSS feeds from TOI, Times Now, NDTV, and The Hindu, scrapes full articles,
-rewrites them via Groq AI (Llama 3.3 70B Versatile), and saves to Supabase.
+rewrites them via Cerebras AI (Qwen 2.5 70B / 250B), and saves to Supabase.
 This version enforces a strict 'Hard News Only' policy for Indian content,
 blocking speculative political commentary, opinions, and features.
 
 Key Features:
 - Reasoning-First Architecture: Forces the AI to 'think' and disambiguate facts 
   before writing.
+- Cerebras Integration: High-speed inference using the OpenAI-compatible SDK.
+- Strict Pacing: Enforces 1 RPM limit to stay within free-tier quotas.
 - Multi-Source Integration: Scrapes and parses content from major Indian news outlets.
 - Strict India News Filter: Automatically skips non-news content for the India category.
-- Intelligent Classification: Uses AI to classify all news as 'india' or 'international'.
-- Trash Filtering: Ignores non-news sections like /offbeat/, sports, or entertainment.
 
-Designed to run 24/7 within Groq Developer/Free tier limits for 70B models.
+Designed to run 24/7 within Cerebras API limits.
 """
 
 import os
@@ -34,8 +34,7 @@ from curl_cffi import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-import groq
-from groq import Groq
+from openai import OpenAI
 
 from supabase import create_client, Client
 
@@ -49,22 +48,19 @@ RSS_FEED_URLS = [
     {"url": "https://timesofindia.indiatimes.com/rssfeeds/296589292.cms", "category": "international", "name": "TOI International"},
     {"url": "https://www.timesnownews.com/feeds/gns-en-india.xml", "category": "india", "name": "Times Now India"},
     {"url": "https://feeds.feedburner.com/ndtvnews-india-news", "category": "india", "name": "NDTV India"},
-    {"url": "https://feeds.feedburner.com/ndtvnews-latest", "category": "auto", "name": "NDTV Latest"},
-    {"url": "https://feeds.feedburner.com/ndtvnews-south", "category": "india", "name": "NDTV South"},
     {"url": "https://feeds.feedburner.com/ndtvnews-world-news", "category": "international", "name": "NDTV World"},
     {"url": "https://www.thehindu.com/news/national/feeder/default.rss", "category": "india", "name": "The Hindu National"},
-    {"url": "https://www.thehindu.com/news/international/feeder/default.rss", "category": "international", "name": "The Hindu International"},
-    {"url": "https://www.thehindu.com/news/states/feeder/default.rss", "category": "india", "name": "The Hindu States"}
+    {"url": "https://www.thehindu.com/news/international/feeder/default.rss", "category": "international", "name": "The Hindu International"}
 ]
-POLL_INTERVAL_SECONDS = 120          # 2 minutes between RSS checks for faster ingestion
-REQUEST_DELAY_SECONDS = 1            # minimal delay with 8 keys
-MAX_ARTICLES_PER_CYCLE = 20          # increased for 8 keys
-DAILY_API_LIMIT = 400                # ~50 articles per key (safe for 100K TPD each)
+POLL_INTERVAL_SECONDS = 180          # 3 minutes between cycles (Strict 1 RPM)
+REQUEST_DELAY_SECONDS = 0            # No delay needed within cycle (1 article per cycle)
+MAX_ARTICLES_PER_CYCLE = 1          # Only process 1 article at a time
+DAILY_API_LIMIT = 1000               # Increased to reset blockage (previously 250)
 MAX_RETRIES = 3                      # retries on transient errors
 ARTICLE_FETCH_TIMEOUT = 15           # seconds for HTTP requests
 
-# ─── Groq API Key Pool ────────────────────────────────────────────────────────
-# Keys are loaded from .env (GROQ_API_KEYS as a comma-separated list)
+# ─── Cerebras API Key Pool ────────────────────────────────────────────────────────
+# Keys are loaded from .env (CEREBRAS_API_KEYS as a comma-separated list)
 
 # Browser-like headers for article scraping
 HTTP_HEADERS = {
@@ -461,27 +457,25 @@ def scrape_article_content(url: str) -> Optional[str]:
             log.warning(f"   [WARN] Request failed for {url}: {e}")
         return None
 
-# ─── Groq AI Rewriter ─────────────────────────────────────────────────────
+# ─── Cerebras AI Rewriter ─────────────────────────────────────────────────────
 
-# ─── Groq AI Rewriter (Multi-Key) ───────────────────────────────────────────
+AI_MODEL = "qwen-3-235b-a22b-instruct-2507"
+CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
-
-class GroqKeyManager:
-    """Manages a pool of Groq API keys with intelligent rotation and health tracking."""
+class AIKeyManager:
+    """Manages a pool of Cerebras API keys with intelligent rotation."""
     
     def __init__(self, keys: list[str]):
         self.keys = keys
-        self.clients = [Groq(api_key=k) for k in keys]
+        self.clients = [OpenAI(api_key=k, base_url=CEREBRAS_BASE_URL) for k in keys]
         self.current_index = 0
-        self.cooldowns = {i: 0 for i in range(len(keys))} # timestamp when key is usable again
-        self.exhausted = set() # keys that hit daily limits
+        self.cooldowns = {i: 0 for i in range(len(keys))}
+        self.exhausted = set()
 
-    def get_client(self) -> tuple[Groq, int]:
+    def get_client(self) -> tuple[OpenAI, int]:
         """Returns the next available client and its index."""
         now = time.time()
         
-        # Try to find a key that isn't on cooldown
         for _ in range(len(self.keys)):
             idx = self.current_index
             if idx not in self.exhausted and now >= self.cooldowns[idx]:
@@ -489,7 +483,6 @@ class GroqKeyManager:
             
             self.current_index = (self.current_index + 1) % len(self.keys)
         
-        # If all keys are on cooldown, pick the one that resets soonest
         best_idx = min(self.cooldowns.keys(), key=lambda i: self.cooldowns[i])
         wait_time = max(0, self.cooldowns[best_idx] - now)
         if wait_time > 0:
@@ -502,35 +495,33 @@ class GroqKeyManager:
         """Put a key on cooldown (e.g., after a 429 error)."""
         self.cooldowns[index] = time.time() + seconds
         log.warning(f"[KEY-MANAGER] Key #{index} put on cooldown for {seconds}s")
-        # Move to next key for next request
         self.current_index = (self.current_index + 1) % len(self.keys)
 
     def mark_exhausted(self, index: int):
-        """Mark a key as exhausted for the day (e.g., hit RPD or TPD limit)."""
+        """Mark a key as exhausted for the day."""
         self.exhausted.add(index)
         log.error(f"[KEY-MANAGER] Key #{index} EXHAUSTED for the day.")
 
-def init_ai() -> GroqKeyManager:
-    """Initialize Groq Key Manager with keys from .env."""
+def init_ai() -> AIKeyManager:
+    """Initialize Cerebras Key Manager with keys from .env."""
     load_dotenv(BASE_DIR / ".env", override=True)
-    keys_str = os.getenv("GROQ_API_KEYS", "")
+    keys_str = os.getenv("CEREBRAS_API_KEYS", "")
     
-    # Split and clean the keys
     keys = [k.strip() for k in keys_str.split(",") if k.strip()]
     
     if not keys:
-        log.error("[FATAL] No GROQ_API_KEYS defined in .env! (Expected comma-separated list)")
+        log.error("[FATAL] No CEREBRAS_API_KEYS defined in .env!")
         sys.exit(1)
         
-    manager = GroqKeyManager(keys)
-    log.info(f"[AI] Initialized with {len(keys)} keys from .env. Model: {GROQ_MODEL}")
+    manager = AIKeyManager(keys)
+    log.info(f"[AI] Initialized with {len(keys)} keys from .env. Model: {AI_MODEL}")
     return manager
 
 
-def rewrite_article(key_manager: GroqKeyManager, title: str, content: str) -> Optional[dict]:
+def rewrite_article(key_manager: AIKeyManager, title: str, content: str) -> Optional[dict]:
     """
-    Send article to Groq for analysis and rewriting using the Reasoning-First architecture.
-    Supports multi-key rotation and intelligent rate-limit handling.
+    Send article to Cerebras for analysis and rewriting.
+    Uses strict rate-limit handling and JSON response extraction.
     """
     prompt = AI_REWRITE_PROMPT.format(title=title, content=content)
 
@@ -538,9 +529,9 @@ def rewrite_article(key_manager: GroqKeyManager, title: str, content: str) -> Op
         client, key_idx = key_manager.get_client()
         
         try:
-            # We use completions.with_raw_response to access rate limit headers
-            raw_response = client.chat.completions.with_raw_response.create(
-                model=GROQ_MODEL,
+            # Using OpenAI SDK standard call
+            response = client.chat.completions.create(
+                model=AI_MODEL,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt}
@@ -550,22 +541,10 @@ def rewrite_article(key_manager: GroqKeyManager, title: str, content: str) -> Op
                 response_format={"type": "json_object"},
             )
 
-            # Check rate limit headers for proactive switching
-            headers = raw_response.headers
-            remaining_tokens = int(headers.get("x-ratelimit-remaining-tokens", 10000))
-            remaining_requests = int(headers.get("x-ratelimit-remaining-requests", 100))
-            
-            # If tokens are low (< 5000) or requests are low (< 2), rotate for next time
-            if remaining_tokens < 5000 or remaining_requests < 2:
-                log.info(f"   [KEY-INFO] Key #{key_idx} low on resources (Tokens: {remaining_tokens}, RPD: {remaining_requests}). Rotating...")
-                key_manager.current_index = (key_idx + 1) % len(key_manager.keys)
-
-            # Parse response
-            completion = raw_response.parse()
-            raw_text = completion.choices[0].message.content
+            raw_text = response.choices[0].message.content
 
             if not raw_text:
-                log.warning(f"   [WARN] Empty Groq response (Key #{key_idx}, attempt {attempt})")
+                log.warning(f"   [WARN] Empty response (Key #{key_idx}, attempt {attempt})")
                 continue
 
             result = json.loads(raw_text)
@@ -573,14 +552,14 @@ def rewrite_article(key_manager: GroqKeyManager, title: str, content: str) -> Op
             # Validate required keys
             required = {"headline", "summary", "body", "is_news", "category"}
             if not required.issubset(result.keys()):
-                log.warning(f"   [WARN] Missing keys in Groq response: {required - set(result.keys())}")
+                log.warning(f"   [WARN] Missing keys in response: {required - set(result.keys())}")
                 continue
 
-            # Log thought process for quality auditing
+            # Log thought process
             thought = result.get("thought_process", "No thought process provided.")
             log.info(f"   [THOUGHT] {thought[:200]}...")
 
-            # Convert NEWPARA markers to actual paragraph breaks
+            # Convert NEWPARA markers
             if "body" in result:
                 result["body"] = result["body"].replace("NEWPARA", "\n\n").strip()
 
@@ -593,12 +572,9 @@ def rewrite_article(key_manager: GroqKeyManager, title: str, content: str) -> Op
             # Handle rate limiting (429)
             if "429" in error_msg or "rate limit" in error_msg:
                 log.warning(f"   [RATE-LIMIT] Key #{key_idx} hit limit. Switching...")
-                
-                # Extract wait time if possible, otherwise default to 60s
                 wait_time = 60
                 if "retry-after" in error_msg:
                     try:
-                        # Simple regex-less extraction for safety
                         parts = error_msg.split("retry-after")[-1].split()
                         for p in parts:
                             if p.isdigit():
@@ -686,12 +662,12 @@ def cleanup_old_data(sb: Client):
 
 # ─── Main Processing Loop ───────────────────────────────────────────────────
 
-def process_cycle(key_manager: GroqKeyManager, sb: Client, tracker: URLTracker) -> int:
+def process_cycle(key_manager: AIKeyManager, sb: Client, tracker: URLTracker) -> int:
     """
     One full processing cycle:
     1. Fetch RSS feed and filter for new content
     2. Scrape full article body
-    3. Analyze and rewrite using Llama 3.3 70B (Reasoning Step)
+    3. Analyze and rewrite using Cerebras AI (Reasoning Step)
     4. Determine category (India vs International)
     5. Save to Supabase and track usage
     
@@ -793,7 +769,7 @@ def main():
     """Main entry point - runs the agent loop 24/7."""
 
     log.info("=" * 60)
-    log.info(">>> AirNews Multi-Source AI Agent (V7.0) Starting")
+    log.info(">>> AirNews Cerebras AI Agent (V8.0) Starting")
     log.info("=" * 60)
     
     log.info(f"[CONFIG] Poll interval: {POLL_INTERVAL_SECONDS}s ({POLL_INTERVAL_SECONDS//60} min)")
