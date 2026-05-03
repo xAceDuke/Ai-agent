@@ -238,8 +238,17 @@ def fetch_rss_feed() -> list[dict]:
                 # Clean URL — remove tracking fragments
                 raw_link = entry.get("link", "")
                 clean_url = raw_link.split("#")[0].strip()
+                url_lower = clean_url.lower()
 
-                if not clean_url or "/offbeat/" in clean_url.lower():
+                # Filter out pure entertainment, sports, health, and lifestyle sections
+                trash_sections = [
+                    "/offbeat/", "/health/", "/entertainment/", "/sports/", 
+                    "/cricket/", "/lifestyle/", "/astrology/", "/movies/", 
+                    "/tv/", "/life-style/", "/web-series/", "/fashion/", 
+                    "/beauty/", "/food-news/"
+                ]
+                
+                if not clean_url or any(section in url_lower for section in trash_sections):
                     continue
 
                 # Extract image URL — TOI uses <enclosure> tag, Times Now might use content
