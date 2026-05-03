@@ -48,7 +48,7 @@ RSS_FEED_URLS = [
     {"url": "https://timesofindia.indiatimes.com/rssfeeds/296589292.cms", "category": "international", "name": "TOI International"},
     {"url": "https://www.timesnownews.com/feeds/gns-en-india.xml", "category": "india", "name": "Times Now India"},
     {"url": "https://feeds.feedburner.com/ndtvnews-india-news", "category": "india", "name": "NDTV India"},
-    {"url": "https://feeds.feedburner.com/ndtvnews-latest", "category": "india", "name": "NDTV Latest"},
+    {"url": "https://feeds.feedburner.com/ndtvnews-latest", "category": "auto", "name": "NDTV Latest"},
     {"url": "https://feeds.feedburner.com/ndtvnews-south", "category": "india", "name": "NDTV South"},
     {"url": "https://feeds.feedburner.com/ndtvnews-world-news", "category": "international", "name": "NDTV World"}
 ]
@@ -268,13 +268,20 @@ def fetch_rss_feed() -> list[dict]:
                 else:
                     clean_desc = ""
 
+                # Smart category detection for mixed feeds
+                if category == "auto":
+                    world_patterns = ["/world-news/", "/world/", "/global/"]
+                    article_category = "international" if any(p in clean_url.lower() for p in world_patterns) else "india"
+                else:
+                    article_category = category
+
                 all_articles.append({
                     "url": clean_url,
                     "title": entry.get("title", "").strip(),
                     "description": clean_desc,
                     "published": entry.get("published", ""),
                     "image_url": image_url,
-                    "category": category
+                    "category": article_category
                 })
 
             log.info(f"[RSS] Fetched {len(feed.entries)} articles from {feed_name} feed")
