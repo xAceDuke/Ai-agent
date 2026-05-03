@@ -1,16 +1,24 @@
 """
-AirNews AI Agent
-================
+AirNews AI Agent (V6.2 - Hard News Edition)
+===========================================
 Fetches RSS feeds from TOI, Times Now, and NDTV, scrapes full articles,
-rewrites them via Groq AI (Llama 3.1), and saves them directly to Supabase.
-Uses AI to classify all news articles as either 'india' or 'international'
-and ignores any articles from /offbeat/ sections.
+rewrites them via Groq AI (Llama 3.3 70B Versatile), and saves to Supabase.
+This version enforces a 'Hard News Only' policy, blocking speculative
+political commentary, opinions, and uncertainty-based stories.
 
-Designed to run 24/7 within Groq free tier limits:
-  - 30 requests/min, 14,400 requests/day
-  - Polls RSS every 3 minutes
-  - Processes max ~1000 articles/day (keeps headroom)
-  - Exponential backoff on rate limit errors
+Key Features:
+- Reasoning-First Architecture: Forces the AI to 'think' and disambiguate facts 
+  (e.g., distinguishing M.K. Stalin from Joseph Stalin) before writing.
+- Noise & Error Filtering: Intelligently identifies and omits incorrect or 
+  confusing facts present in the source material.
+- Intelligent Classification: Uses AI to classify all news as 'india' or 'international'.
+- Trash Filtering: Ignores non-news sections like /offbeat/, sports, or entertainment.
+
+Designed to run 24/7 within Groq Developer/Free tier limits for 70B models:
+- Optimized for Llama 3.3 70B rate limits (30 RPM, 100k TPM).
+- Processes max ~800 articles/day to maintain token budget.
+- 5-second delay between API calls to prevent rate limiting.
+- Exponential backoff on 429 errors.
 
 Usage:
   1. Copy .env.example to .env and add your GROQ_API_KEY, SUPABASE_URL, and SUPABASE_KEY
@@ -55,9 +63,9 @@ RSS_FEED_URLS = [
     {"url": "https://feeds.feedburner.com/ndtvnews-world-news", "category": "international", "name": "NDTV World"}
 ]
 POLL_INTERVAL_SECONDS = 180          # 3 minutes between RSS checks for near real-time
-REQUEST_DELAY_SECONDS = 2            # delay between Groq API calls
-MAX_ARTICLES_PER_CYCLE = 15          # max articles to process per poll cycle
-DAILY_API_LIMIT = 1000               # stay under generous Groq RPD with headroom
+REQUEST_DELAY_SECONDS = 5            # increased delay for 70B rate limits
+MAX_ARTICLES_PER_CYCLE = 10          # smaller batch for higher quality and token budget
+DAILY_API_LIMIT = 800                # safer limit for 70B TPD (Tokens Per Day)
 MAX_RETRIES = 3                      # retries on transient errors
 ARTICLE_FETCH_TIMEOUT = 15           # seconds for HTTP requests
 
@@ -84,22 +92,49 @@ HTTP_HEADERS = {
     "Referer": "https://www.google.com/",
 }
 
-AI_REWRITE_PROMPT = """You are a friendly, human-sounding writer for a popular news blog. Your task is to completely rewrite the provided news article from the ground up so that it is extremely easy to read, highly engaging, and uses simple everyday English. It must sound like a real human wrote it to explain the news to a friend.
+SYSTEM_PROMPT = """You are an elite senior news editor for AirNews, renowned for deep situational analysis and incisive reporting. Your goal is to produce reports that provide not just the facts, but the broader context and potential future implications.
 
-CRITICAL PLAGIARISM & SIMILARITY RULE: 
-You MUST completely rewrite the article from scratch. Do NOT simply substitute words or follow the original paragraph flow. Read the facts, understand them, and write a completely fresh, original story. The resulting text must NOT resemble the source material's phrasing or structure in any way.
+EDITORIAL PRINCIPLES:
+1. PROFESSIONAL CLARITY: Write in a sophisticated but accessible style. Use precise vocabulary but avoid overly dense or academic language.
+2. BALANCED TONE: Maintain the objectivity of a global news agency while providing sharp, analytical insights.
+3. GEOPOLITICAL DISAMBIGUATION: Always verify the identity of people mentioned. For example, if 'Stalin' is mentioned in the context of Tamil Nadu or India, it refers to the Chief Minister M.K. Stalin, NOT the historical Soviet leader Joseph Stalin.
+4. GEOGRAPHICAL CONTEXT: Carefully distinguish between domestic (Indian) and international news based on locations, names, and organizations.
+5. DEEP REASONING & PROJECTION: You must think holistically to understand the full scope of the situation. Identify:
+   - Core Facts: Key entities, roles, locations, and the primary event.
+   - Contextual Links: How does this relate to historical events or current global trends?
+   - Logical Projections: What are the likely next steps, future implications, or potential outcomes of this news?
+   - Situational Nuance: What are the secondary effects on society, markets, or geopolitics?
+6. FACT FILTERING & NOISE REDUCTION: If you detect that the source article contains factual errors, logical contradictions, or clearly incorrect data, do NOT include those errors. Intelligently filter out the "noise" and focus only on the verified core of the story.
+7. HARD NEWS FOCUS: Differentiate strictly between a 'Hard News' event (e.g., 'A bill was passed', 'A protest occurred') and 'Speculative Commentary' (e.g., 'A politician's entry might change things', 'Observers are worried'). Only classify the former as 'is_news'.
+"""
 
-Guidelines for a Simple, Human Tone:
-1. Easy to Understand: Use simple, everyday vocabulary. Avoid complex jargon, overly academic words, or long-winded sentences. Write at an 8th-grade reading level so anyone can understand it instantly.
-2. Avoid AI Clichés: DO NOT use robotic or overly dramatic phrasing like "delving into," "a testament to," "in a surprising turn of events," "it is worth noting," "moreover," or "in conclusion." Write like a normal human speaks!
-3. Conversational Style: Adopt a warm, engaging, and direct tone. Make the reader feel like you are explaining the news directly to them.
-4. Fact-Driven: Keep all the facts 100% accurate, just explain them simpler.
-5. Format: Create a catchy, highly original headline. Write a compelling 2-3 sentence summary. The body should be structured into 4+ distinct paragraphs for easy reading. Generate exactly 5 relevant topic tags.
-6. Structure Requirement: Separate body paragraphs using the exact text marker "NEWPARA" (do not use actual newline characters in the body string).
-7. JSON Escaping: You are generating raw JSON. You MUST properly escape all double quotes inside the text using a backslash (e.g., \\"). Do not break the JSON format.
+AI_REWRITE_PROMPT = """Perform an advanced editorial analysis of the provided news article and rewrite it into a comprehensive report.
 
-You MUST return ONLY a valid JSON object. No markdown formatting, no code blocks, and no extra text. Use exactly this structure:
-{{"headline": "...", "summary": "...", "body": "First paragraph text NEWPARA Second paragraph text NEWPARA Third paragraph text NEWPARA Fourth paragraph text", "tags": ["tag1", "tag2", "tag3", "tag4", "tag5"]}}
+Your task is to produce a version that is authoritative, objective, and deeply insightful. It should provide a clear narrative of the events while situating them within their broader context and highlighting potential future outcomes.
+
+EDITORIAL REQUIREMENTS:
+1. Content Classification: Set 'is_news' to true ONLY if the content reports on a verified factual event that has already occurred or an official announcement/data release. Set to false (Article) for:
+   - Speculative political analysis (e.g., 'Entry sparks uncertainty', 'Future of X in doubt').
+   - Opinion pieces, editorials, and commentary.
+   - Stories focused on 'buzz', sentiment, or 'what-if' scenarios without a major new event.
+   - Lifestyle, listicles, advice, or general interest features.
+2. Balanced Vocabulary: Use professional, sophisticated English. Aim for clarity and precision.
+2. Narrative Flow & Outlook: Use the 'inverted pyramid' style for the lead, but ensure the closing sections provide an outlook on future implications or the logical next steps in the situation.
+3. Zero AI Clichés: DO NOT use repetitive AI phrases like "delving into," "testament to," "moreover," or "in conclusion."
+4. Fact Integrity: Ensure 100% factual accuracy. If a detail in the source seems incorrect or suspicious, omit it.
+5. Format: Create a strong, professional headline and a 2-3 sentence executive summary. The body should consist of 4+ distinct paragraphs separated by "NEWPARA".
+
+You MUST return ONLY a valid JSON object.
+Structure:
+{{
+  "is_news": boolean, (Set to true if this is timely News, false if it is a Feature, Opinion, or general Article)
+  "category": "india" or "international", (Determine based on the locations and entities mentioned)
+  "thought_process": "Your deep analysis of the situation: Core facts, historical/global context, logical projections, and plan for an insightful rewrite.",
+  "headline": "Professional headline",
+  "summary": "Executive summary with contextual insight",
+  "body": "Paragraph 1 NEWPARA Paragraph 2 NEWPARA ... (Ensure the final paragraph provides a situational outlook)",
+  "tags": ["tag1", "tag2", "tag3", "tag4", "tag5"]
+}}
 
 Original Title: {title}
 Original Content: {content}
@@ -427,7 +462,7 @@ def scrape_article_content(url: str) -> Optional[str]:
 
 # ─── Groq AI Rewriter ─────────────────────────────────────────────────────
 
-GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 def init_ai() -> Groq:
     """Initialize Groq client with API key from .env."""
@@ -445,8 +480,8 @@ def init_ai() -> Groq:
 
 def rewrite_article(client: Groq, title: str, content: str) -> Optional[dict]:
     """
-    Send article to Groq for rewriting.
-    Returns parsed JSON dict or None on failure.
+    Send article to Groq for analysis and rewriting using the Reasoning-First architecture.
+    Returns parsed JSON dict including 'thought_process', 'headline', 'summary', and 'body'.
     Implements retry with exponential backoff for rate limits.
     """
     prompt = AI_REWRITE_PROMPT.format(title=title, content=content)
@@ -455,9 +490,12 @@ def rewrite_article(client: Groq, title: str, content: str) -> Optional[dict]:
         try:
             response = client.chat.completions.create(
                 model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ],
                 temperature=0.7,
-                max_tokens=2048,
+                max_tokens=3000,
                 response_format={"type": "json_object"},
             )
 
@@ -470,16 +508,20 @@ def rewrite_article(client: Groq, title: str, content: str) -> Optional[dict]:
             result = json.loads(raw_text)
 
             # Validate required keys
-            required = {"headline", "summary", "body"}
+            required = {"headline", "summary", "body", "is_news", "category"}
             if not required.issubset(result.keys()):
                 log.warning(f"   [WARN] Missing keys in Groq response: {required - set(result.keys())}")
                 continue
+
+            # Log thought process for quality auditing
+            thought = result.get("thought_process", "No thought process provided.")
+            log.info(f"   [THOUGHT] {thought[:200]}...")
 
             # Convert NEWPARA markers to actual paragraph breaks
             if "body" in result:
                 result["body"] = result["body"].replace("NEWPARA", "\n\n").strip()
 
-            log.info(f"   [OK] Rewrite complete: \"{result['headline'][:60]}...\"")
+            log.info(f"   [OK] Rewrite complete: \"{result.get('headline', '')[:60]}...\"")
             return result
 
         except json.JSONDecodeError as e:
@@ -535,6 +577,21 @@ def save_article_supabase(sb: Client, article_data: dict, rewritten: dict) -> bo
         log.error(f"   [ERROR] Failed to save to Supabase: {e}")
         return False
 
+def save_ignored_article_supabase(sb: Client, article: dict, rewritten: dict):
+    """Save an article that was filtered out as non-news to the ignored_articles table."""
+    try:
+        data = {
+            "original_url": article["url"],
+            "original_title": article["title"],
+            "category": article["category"],
+            "thought_process": rewritten.get("thought_process", ""),
+            "processed_at": datetime.now(timezone.utc).isoformat()
+        }
+        sb.table("ignored_articles").upsert(data, on_conflict="original_url").execute()
+        log.info(f"   [LOGGED] Recorded ignored article in DB")
+    except Exception as e:
+        log.error(f"   [ERROR] Failed to save to ignored_articles: {e}")
+
 # ─── Data Cleanup ────────────────────────────────────────────────────────────
 
 def cleanup_old_data(sb: Client):
@@ -546,6 +603,7 @@ def cleanup_old_data(sb: Client):
         # but we can execute the delete and rely on Supabase.
         sb.table("articles").delete().lt("processed_at", thirty_days_ago).execute()
         sb.table("visited_urls").delete().lt("visited_at", thirty_days_ago).execute()
+        sb.table("ignored_articles").delete().lt("processed_at", thirty_days_ago).execute()
     except Exception as e:
         log.error(f"[ERROR] Cleanup failed: {e}")
 
@@ -554,12 +612,12 @@ def cleanup_old_data(sb: Client):
 def process_cycle(client: Groq, sb: Client, tracker: URLTracker) -> int:
     """
     One full processing cycle:
-    1. Fetch RSS feed
-    2. Filter out already-visited URLs
-    3. Scrape & rewrite new articles
-    4. Save to Supabase
-
-
+    1. Fetch RSS feed and filter for new content
+    2. Scrape full article body
+    3. Analyze and rewrite using Llama 3.3 70B (Reasoning Step)
+    4. Determine category (India vs International)
+    5. Save to Supabase and track usage
+    
     Returns number of articles processed.
     """
     # Check daily quota
@@ -617,27 +675,23 @@ def process_cycle(client: Groq, sb: Client, tracker: URLTracker) -> int:
             # Don't mark as visited so we can retry next cycle
             continue
 
-        # Intelligent category filtering for ALL news articles
-        if article.get("category") == "needs_ai":
-            try:
-                log.info("   [AI CATEGORY] Determining category (india vs international)...")
-                cat_prompt = f"Categorize this news article as either 'international' or 'india'. Reply ONLY with the single word 'international' or 'india'.\n\nTitle: {article['title']}\nContent: {content[:1000]}"
-                response = client.chat.completions.create(
-                    model=GROQ_MODEL,
-                    messages=[{"role": "user", "content": cat_prompt}],
-                    temperature=0.1,
-                    max_tokens=10,
-                )
-                ai_cat = response.choices[0].message.content.strip().lower()
-                # Sanitize the output
-                if "international" in ai_cat or "world" in ai_cat:
-                    article["category"] = "international"
-                else:
-                    article["category"] = "india"
-                log.info(f"   [AI CATEGORY] Classified as: {article['category']}")
-            except Exception as e:
-                log.error(f"   [ERROR] AI category classification failed: {e}")
-                article["category"] = "india" # Fallback
+        # Use the AI-determined category
+        ai_determined_cat = rewritten.get("category", "india").lower()
+        if "international" in ai_determined_cat or "world" in ai_determined_cat:
+            article["category"] = "international"
+        else:
+            article["category"] = "india"
+
+        # Filter out non-news articles ONLY if category is india
+        if not rewritten.get("is_news", True) and article["category"] == "india":
+            log.info(f"   [IGNORE] Indian 'Article/Feature' detected. Skipping...")
+            save_ignored_article_supabase(sb, article, rewritten)
+            tracker.mark_visited(article["url"])
+            continue
+
+        if not rewritten.get("is_news", True) and article["category"] == "international":
+            log.info(f"   [PASS] International Article/Feature detected. Allowing per updated rules.")
+
 
         # Step 3: Save to Supabase
         save_article_supabase(sb, article, rewritten)
