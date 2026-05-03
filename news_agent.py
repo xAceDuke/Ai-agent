@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 import feedparser
-import requests
+from curl_cffi import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
@@ -44,9 +44,13 @@ BASE_DIR = Path(__file__).parent
 LOG_FILE = BASE_DIR / "agent.log"
 
 RSS_FEED_URLS = [
-    "https://timesofindia.indiatimes.com/rssfeeds/-2128936835.cms", # India News
-    "https://timesofindia.indiatimes.com/rssfeeds/296589292.cms",   # International News
-    "https://www.timesnownews.com/feeds/gns-en-india.xml"           # Times Now India News
+    {"url": "https://timesofindia.indiatimes.com/rssfeeds/-2128936835.cms", "category": "india", "name": "TOI India"},
+    {"url": "https://timesofindia.indiatimes.com/rssfeeds/296589292.cms", "category": "international", "name": "TOI International"},
+    {"url": "https://www.timesnownews.com/feeds/gns-en-india.xml", "category": "india", "name": "Times Now India"},
+    {"url": "https://feeds.feedburner.com/ndtvnews-india-news", "category": "india", "name": "NDTV India"},
+    {"url": "https://feeds.feedburner.com/ndtvnews-latest", "category": "india", "name": "NDTV Latest"},
+    {"url": "https://feeds.feedburner.com/ndtvnews-south", "category": "india", "name": "NDTV South"},
+    {"url": "https://feeds.feedburner.com/ndtvnews-world-news", "category": "international", "name": "NDTV World"}
 ]
 POLL_INTERVAL_SECONDS = 180          # 3 minutes between RSS checks for near real-time
 REQUEST_DELAY_SECONDS = 2            # delay between Groq API calls
@@ -214,10 +218,13 @@ class URLTracker:
 # ─── RSS Feed Parser ────────────────────────────────────────────────────────
 
 def fetch_rss_feed() -> list[dict]:
-    """Fetch and parse the Times of India RSS feeds. Returns list of article dicts."""
+    """Fetch and parse the RSS feeds. Returns list of article dicts."""
     all_articles = []
     
-    for feed_url in RSS_FEED_URLS:
+    for feed_info in RSS_FEED_URLS:
+        feed_url = feed_info["url"]
+        category = feed_info["category"]
+        feed_name = feed_info["name"]
         try:
             feed = feedparser.parse(feed_url)
 
@@ -267,14 +274,9 @@ def fetch_rss_feed() -> list[dict]:
                     "description": clean_desc,
                     "published": entry.get("published", ""),
                     "image_url": image_url,
+                    "category": category
                 })
 
-            if "2128936835" in feed_url:
-                feed_name = "TOI India"
-            elif "gns-en-india.xml" in feed_url:
-                feed_name = "Times Now India"
-            else:
-                feed_name = "TOI International"
             log.info(f"[RSS] Fetched {len(feed.entries)} articles from {feed_name} feed")
 
         except Exception as e:
@@ -290,9 +292,8 @@ def scrape_article_content(url: str) -> Optional[str]:
     Uses multiple fallback selectors to handle layout variations.
     """
     try:
-        session = requests.Session()
-        response = session.get(
-            url, headers=HTTP_HEADERS, timeout=ARTICLE_FETCH_TIMEOUT
+        response = requests.get(
+            url, impersonate="chrome110", timeout=ARTICLE_FETCH_TIMEOUT
         )
         response.raise_for_status()
 
@@ -396,14 +397,12 @@ def scrape_article_content(url: str) -> Optional[str]:
         log.warning(f"   [WARN] Insufficient content scraped ({len(content_text)} chars)")
         return None
 
-    except requests.exceptions.HTTPError as e:
-        log.warning(f"   [WARN] HTTP {e.response.status_code} for {url}")
-        return None
-    except requests.exceptions.RequestException as e:
-        log.warning(f"   [WARN] Request failed for {url}: {e}")
-        return None
     except Exception as e:
-        log.error(f"   [ERROR] Scrape error: {e}")
+        # Check if e has response and status_code for HTTPError equivalent
+        if hasattr(e, "response") and hasattr(e.response, "status_code"):
+            log.warning(f"   [WARN] HTTP {e.response.status_code} for {url}")
+        else:
+            log.warning(f"   [WARN] Request failed for {url}: {e}")
         return None
 
 # ─── Groq AI Rewriter ─────────────────────────────────────────────────────
@@ -501,6 +500,7 @@ def save_article_supabase(sb: Client, article_data: dict, rewritten: dict) -> bo
         "tags": rewritten.get("tags", []),
         "processed_at": datetime.now(timezone.utc).isoformat(),
         "source": "AirNews",
+        "category": article_data.get("category", "india")
     }
 
     try:
