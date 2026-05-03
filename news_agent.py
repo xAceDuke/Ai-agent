@@ -1,17 +1,19 @@
 """
-Times of India Live News AI Agent
-==================================
-Fetches TOI India News RSS feed, scrapes full articles, rewrites them
-via Groq AI (Llama 3), and saves as JSON to ./news/ directory.
+AirNews AI Agent
+================
+Fetches RSS feeds from TOI, Times Now, and NDTV, scrapes full articles,
+rewrites them via Groq AI (Llama 3.1), and saves them directly to Supabase.
+Uses AI to classify all news articles as either 'india' or 'international'
+and ignores any articles from /offbeat/ sections.
 
 Designed to run 24/7 within Groq free tier limits:
   - 30 requests/min, 14,400 requests/day
-  - Polls RSS every 10 minutes
+  - Polls RSS every 3 minutes
   - Processes max ~1000 articles/day (keeps headroom)
   - Exponential backoff on rate limit errors
 
 Usage:
-  1. Copy .env.example to .env and add your GROQ_API_KEY
+  1. Copy .env.example to .env and add your GROQ_API_KEY, SUPABASE_URL, and SUPABASE_KEY
   2. pip install -r requirements.txt
   3. python news_agent.py
 """
@@ -237,7 +239,7 @@ def fetch_rss_feed() -> list[dict]:
                 raw_link = entry.get("link", "")
                 clean_url = raw_link.split("#")[0].strip()
 
-                if not clean_url:
+                if not clean_url or "/offbeat/" in clean_url.lower():
                     continue
 
                 # Extract image URL — TOI uses <enclosure> tag, Times Now might use content
@@ -268,27 +270,8 @@ def fetch_rss_feed() -> list[dict]:
                 else:
                     clean_desc = ""
 
-                # Smart category detection for mixed feeds
-                if category == "auto":
-                    world_url_patterns = ["/world-news/", "/world/", "/global/"]
-                    world_title_keywords = [
-                        "trump", "biden", "us ", "u.s.", "america", "iran", "tehran",
-                        "israel", "gaza", "palestine", "ukraine", "russia", "putin",
-                        "china", "beijing", "pakistan", "afghanistan", "taliban",
-                        "nato", "un ", "united nations", "european", "eu ", "brexit",
-                        "australia", "canada", "japan", "korea", "saudi", "yemen",
-                        "somalia", "syria", "iraq", "turkey", "erdogan", "macron",
-                        "british", "uk ", "london", "paris", "berlin",
-                    ]
-                    title_lower = entry.get("title", "").lower()
-                    url_lower = clean_url.lower()
-                    is_world = (
-                        any(p in url_lower for p in world_url_patterns)
-                        or any(kw in title_lower for kw in world_title_keywords)
-                    )
-                    article_category = "international" if is_world else "india"
-                else:
-                    article_category = category
+                # All articles use AI category determination
+                article_category = "needs_ai"
 
                 all_articles.append({
                     "url": clean_url,
@@ -618,6 +601,28 @@ def process_cycle(client: Groq, sb: Client, tracker: URLTracker) -> int:
             log.warning("   [SKIP] Rewrite failed")
             # Don't mark as visited so we can retry next cycle
             continue
+
+        # Intelligent category filtering for ALL news articles
+        if article.get("category") == "needs_ai":
+            try:
+                log.info("   [AI CATEGORY] Determining category (india vs international)...")
+                cat_prompt = f"Categorize this news article as either 'international' or 'india'. Reply ONLY with the single word 'international' or 'india'.\n\nTitle: {article['title']}\nContent: {content[:1000]}"
+                response = client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=[{"role": "user", "content": cat_prompt}],
+                    temperature=0.1,
+                    max_tokens=10,
+                )
+                ai_cat = response.choices[0].message.content.strip().lower()
+                # Sanitize the output
+                if "international" in ai_cat or "world" in ai_cat:
+                    article["category"] = "international"
+                else:
+                    article["category"] = "india"
+                log.info(f"   [AI CATEGORY] Classified as: {article['category']}")
+            except Exception as e:
+                log.error(f"   [ERROR] AI category classification failed: {e}")
+                article["category"] = "india" # Fallback
 
         # Step 3: Save to Supabase
         save_article_supabase(sb, article, rewritten)
