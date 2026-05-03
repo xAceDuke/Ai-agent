@@ -270,8 +270,23 @@ def fetch_rss_feed() -> list[dict]:
 
                 # Smart category detection for mixed feeds
                 if category == "auto":
-                    world_patterns = ["/world-news/", "/world/", "/global/"]
-                    article_category = "international" if any(p in clean_url.lower() for p in world_patterns) else "india"
+                    world_url_patterns = ["/world-news/", "/world/", "/global/"]
+                    world_title_keywords = [
+                        "trump", "biden", "us ", "u.s.", "america", "iran", "tehran",
+                        "israel", "gaza", "palestine", "ukraine", "russia", "putin",
+                        "china", "beijing", "pakistan", "afghanistan", "taliban",
+                        "nato", "un ", "united nations", "european", "eu ", "brexit",
+                        "australia", "canada", "japan", "korea", "saudi", "yemen",
+                        "somalia", "syria", "iraq", "turkey", "erdogan", "macron",
+                        "british", "uk ", "london", "paris", "berlin",
+                    ]
+                    title_lower = entry.get("title", "").lower()
+                    url_lower = clean_url.lower()
+                    is_world = (
+                        any(p in url_lower for p in world_url_patterns)
+                        or any(kw in title_lower for kw in world_title_keywords)
+                    )
+                    article_category = "international" if is_world else "india"
                 else:
                     article_category = category
 
