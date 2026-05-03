@@ -1,29 +1,20 @@
 """
-AirNews AI Agent (V6.2 - Hard News Edition)
-===========================================
-Fetches RSS feeds from TOI, Times Now, and NDTV, scrapes full articles,
+AirNews AI Agent (V7.0 - Multi-Source Hard News Edition)
+========================================================
+Fetches RSS feeds from TOI, Times Now, NDTV, and The Hindu, scrapes full articles,
 rewrites them via Groq AI (Llama 3.3 70B Versatile), and saves to Supabase.
-This version enforces a 'Hard News Only' policy, blocking speculative
-political commentary, opinions, and uncertainty-based stories.
+This version enforces a strict 'Hard News Only' policy for Indian content,
+blocking speculative political commentary, opinions, and features.
 
 Key Features:
 - Reasoning-First Architecture: Forces the AI to 'think' and disambiguate facts 
-  (e.g., distinguishing M.K. Stalin from Joseph Stalin) before writing.
-- Noise & Error Filtering: Intelligently identifies and omits incorrect or 
-  confusing facts present in the source material.
+  before writing.
+- Multi-Source Integration: Scrapes and parses content from major Indian news outlets.
+- Strict India News Filter: Automatically skips non-news content for the India category.
 - Intelligent Classification: Uses AI to classify all news as 'india' or 'international'.
 - Trash Filtering: Ignores non-news sections like /offbeat/, sports, or entertainment.
 
-Designed to run 24/7 within Groq Developer/Free tier limits for 70B models:
-- Optimized for Llama 3.3 70B rate limits (30 RPM, 100k TPM).
-- Processes max ~800 articles/day to maintain token budget.
-- 5-second delay between API calls to prevent rate limiting.
-- Exponential backoff on 429 errors.
-
-Usage:
-  1. Copy .env.example to .env and add your GROQ_API_KEY, SUPABASE_URL, and SUPABASE_KEY
-  2. pip install -r requirements.txt
-  3. python news_agent.py
+Designed to run 24/7 within Groq Developer/Free tier limits for 70B models.
 """
 
 import os
@@ -60,14 +51,20 @@ RSS_FEED_URLS = [
     {"url": "https://feeds.feedburner.com/ndtvnews-india-news", "category": "india", "name": "NDTV India"},
     {"url": "https://feeds.feedburner.com/ndtvnews-latest", "category": "auto", "name": "NDTV Latest"},
     {"url": "https://feeds.feedburner.com/ndtvnews-south", "category": "india", "name": "NDTV South"},
-    {"url": "https://feeds.feedburner.com/ndtvnews-world-news", "category": "international", "name": "NDTV World"}
+    {"url": "https://feeds.feedburner.com/ndtvnews-world-news", "category": "international", "name": "NDTV World"},
+    {"url": "https://www.thehindu.com/news/national/feeder/default.rss", "category": "india", "name": "The Hindu National"},
+    {"url": "https://www.thehindu.com/news/international/feeder/default.rss", "category": "international", "name": "The Hindu International"},
+    {"url": "https://www.thehindu.com/news/states/feeder/default.rss", "category": "india", "name": "The Hindu States"}
 ]
-POLL_INTERVAL_SECONDS = 180          # 3 minutes between RSS checks for near real-time
-REQUEST_DELAY_SECONDS = 5            # increased delay for 70B rate limits
-MAX_ARTICLES_PER_CYCLE = 10          # smaller batch for higher quality and token budget
-DAILY_API_LIMIT = 800                # safer limit for 70B TPD (Tokens Per Day)
+POLL_INTERVAL_SECONDS = 120          # 2 minutes between RSS checks for faster ingestion
+REQUEST_DELAY_SECONDS = 1            # minimal delay with 8 keys
+MAX_ARTICLES_PER_CYCLE = 20          # increased for 8 keys
+DAILY_API_LIMIT = 400                # ~50 articles per key (safe for 100K TPD each)
 MAX_RETRIES = 3                      # retries on transient errors
 ARTICLE_FETCH_TIMEOUT = 15           # seconds for HTTP requests
+
+# ─── Groq API Key Pool ────────────────────────────────────────────────────────
+# Keys are loaded from .env (GROQ_API_KEYS as a comma-separated list)
 
 # Browser-like headers for article scraping
 HTTP_HEADERS = {
@@ -105,7 +102,8 @@ EDITORIAL PRINCIPLES:
    - Logical Projections: What are the likely next steps, future implications, or potential outcomes of this news?
    - Situational Nuance: What are the secondary effects on society, markets, or geopolitics?
 6. FACT FILTERING & NOISE REDUCTION: If you detect that the source article contains factual errors, logical contradictions, or clearly incorrect data, do NOT include those errors. Intelligently filter out the "noise" and focus only on the verified core of the story.
-7. HARD NEWS FOCUS: Differentiate strictly between a 'Hard News' event (e.g., 'A bill was passed', 'A protest occurred') and 'Speculative Commentary' (e.g., 'A politician's entry might change things', 'Observers are worried'). Only classify the former as 'is_news'.
+7. HARD NEWS FOCUS (INDIA): For Indian news, you must be extremely strict. Differentiate between a 'Hard News' event (e.g., 'A law was enacted', 'A major accident occurred', 'A policy was announced') and 'Articles/Features/Commentary' (e.g., 'The significance of X', 'Why Y happened', 'Opinions on Z'). Only classify factual, time-sensitive events as 'is_news' for India.
+8. INTERNATIONAL FLEXIBILITY: For international news, you may allow slightly broader features or analytical articles if they provide significant global context, but still prioritize hard news.
 """
 
 AI_REWRITE_PROMPT = """Perform an advanced editorial analysis of the provided news article and rewrite it into a comprehensive report.
@@ -113,21 +111,21 @@ AI_REWRITE_PROMPT = """Perform an advanced editorial analysis of the provided ne
 Your task is to produce a version that is authoritative, objective, and deeply insightful. It should provide a clear narrative of the events while situating them within their broader context and highlighting potential future outcomes.
 
 EDITORIAL REQUIREMENTS:
-1. Content Classification: Set 'is_news' to true ONLY if the content reports on a verified factual event that has already occurred or an official announcement/data release. Set to false (Article) for:
+1. Content Classification: Set 'is_news' to true ONLY if the content reports on a verified factual event that has already occurred or an official announcement/data release. This is critical for Indian content. Set to false (Article) for:
    - Speculative political analysis (e.g., 'Entry sparks uncertainty', 'Future of X in doubt').
    - Opinion pieces, editorials, and commentary.
    - Stories focused on 'buzz', sentiment, or 'what-if' scenarios without a major new event.
    - Lifestyle, listicles, advice, or general interest features.
 2. Balanced Vocabulary: Use professional, sophisticated English. Aim for clarity and precision.
-2. Narrative Flow & Outlook: Use the 'inverted pyramid' style for the lead, but ensure the closing sections provide an outlook on future implications or the logical next steps in the situation.
-3. Zero AI Clichés: DO NOT use repetitive AI phrases like "delving into," "testament to," "moreover," or "in conclusion."
-4. Fact Integrity: Ensure 100% factual accuracy. If a detail in the source seems incorrect or suspicious, omit it.
-5. Format: Create a strong, professional headline and a 2-3 sentence executive summary. The body should consist of 4+ distinct paragraphs separated by "NEWPARA".
+3. Narrative Flow & Outlook: Use the 'inverted pyramid' style for the lead, but ensure the closing sections provide an outlook on future implications or the logical next steps in the situation.
+4. Zero AI Clichés: DO NOT use repetitive AI phrases like "delving into," "testament to," "moreover," or "in conclusion."
+5. Fact Integrity: Ensure 100% factual accuracy. If a detail in the source seems incorrect or suspicious, omit it.
+6. Format: Create a strong, professional headline and a 2-3 sentence executive summary. The body should consist of 4+ distinct paragraphs separated by "NEWPARA".
 
 You MUST return ONLY a valid JSON object.
 Structure:
 {{
-  "is_news": boolean, (Set to true if this is timely News, false if it is a Feature, Opinion, or general Article)
+  "is_news": boolean, (Strictly true for timely News, false for Features, Opinions, or general Articles. Be especially strict for India category)
   "category": "india" or "international", (Determine based on the locations and entities mentioned)
   "thought_process": "Your deep analysis of the situation: Core facts, historical/global context, logical projections, and plan for an insightful rewrite.",
   "headline": "Professional headline",
@@ -398,16 +396,19 @@ def scrape_article_content(url: str) -> Optional[str]:
             for el in soup.find_all(class_=lambda c: c and cls in c.lower() if c else False):
                 el.decompose()
 
-        # Strategy 1: TOI-specific article content containers
+        # Strategy 1: Source-specific article content containers
         content_selectors = [
             {"class_": "_s30J"},                           # TOI primary article body
             {"class_": "_bIDB"},                           # TOI content wrapper
             {"class_": "ga-headlines"},                     # TOI alternate
             {"class_": "artText"},                          # TOI older layout
             {"class_": "Normal"},                           # TOI paragraph class
-            {"itemprop": "articleBody"},
-            {"class_": "article-body"},
-            "article",
+            {"id": lambda x: x and x.startswith("content-body-")}, # The Hindu primary
+            {"class_": "article-body-container"},           # The Hindu alternate
+            {"class_": "content-body"},                     # The Hindu alternate
+            {"itemprop": "articleBody"},                    # Generic standard
+            {"class_": "article-body"},                     # Generic standard
+            "article",                                      # Semantic standard
         ]
 
         for selector in content_selectors:
@@ -462,33 +463,83 @@ def scrape_article_content(url: str) -> Optional[str]:
 
 # ─── Groq AI Rewriter ─────────────────────────────────────────────────────
 
+# ─── Groq AI Rewriter (Multi-Key) ───────────────────────────────────────────
+
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-def init_ai() -> Groq:
-    """Initialize Groq client with API key from .env."""
+class GroqKeyManager:
+    """Manages a pool of Groq API keys with intelligent rotation and health tracking."""
+    
+    def __init__(self, keys: list[str]):
+        self.keys = keys
+        self.clients = [Groq(api_key=k) for k in keys]
+        self.current_index = 0
+        self.cooldowns = {i: 0 for i in range(len(keys))} # timestamp when key is usable again
+        self.exhausted = set() # keys that hit daily limits
+
+    def get_client(self) -> tuple[Groq, int]:
+        """Returns the next available client and its index."""
+        now = time.time()
+        
+        # Try to find a key that isn't on cooldown
+        for _ in range(len(self.keys)):
+            idx = self.current_index
+            if idx not in self.exhausted and now >= self.cooldowns[idx]:
+                return self.clients[idx], idx
+            
+            self.current_index = (self.current_index + 1) % len(self.keys)
+        
+        # If all keys are on cooldown, pick the one that resets soonest
+        best_idx = min(self.cooldowns.keys(), key=lambda i: self.cooldowns[i])
+        wait_time = max(0, self.cooldowns[best_idx] - now)
+        if wait_time > 0:
+            log.info(f"[KEY-MANAGER] All keys on cooldown. Waiting {int(wait_time)}s for Key #{best_idx}...")
+            time.sleep(wait_time)
+        
+        return self.clients[best_idx], best_idx
+
+    def mark_cooldown(self, index: int, seconds: int = 60):
+        """Put a key on cooldown (e.g., after a 429 error)."""
+        self.cooldowns[index] = time.time() + seconds
+        log.warning(f"[KEY-MANAGER] Key #{index} put on cooldown for {seconds}s")
+        # Move to next key for next request
+        self.current_index = (self.current_index + 1) % len(self.keys)
+
+    def mark_exhausted(self, index: int):
+        """Mark a key as exhausted for the day (e.g., hit RPD or TPD limit)."""
+        self.exhausted.add(index)
+        log.error(f"[KEY-MANAGER] Key #{index} EXHAUSTED for the day.")
+
+def init_ai() -> GroqKeyManager:
+    """Initialize Groq Key Manager with keys from .env."""
     load_dotenv(BASE_DIR / ".env", override=True)
-    api_key = os.getenv("GROQ_API_KEY")
-
-    if not api_key or api_key == "your_groq_api_key_here":
-        log.error("[FATAL] GROQ_API_KEY not set! Copy .env.example to .env and add your key.")
+    keys_str = os.getenv("GROQ_API_KEYS", "")
+    
+    # Split and clean the keys
+    keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+    
+    if not keys:
+        log.error("[FATAL] No GROQ_API_KEYS defined in .env! (Expected comma-separated list)")
         sys.exit(1)
+        
+    manager = GroqKeyManager(keys)
+    log.info(f"[AI] Initialized with {len(keys)} keys from .env. Model: {GROQ_MODEL}")
+    return manager
 
-    client = Groq(api_key=api_key)
-    log.info(f"[AI] Using Groq model: {GROQ_MODEL}")
-    return client
 
-
-def rewrite_article(client: Groq, title: str, content: str) -> Optional[dict]:
+def rewrite_article(key_manager: GroqKeyManager, title: str, content: str) -> Optional[dict]:
     """
     Send article to Groq for analysis and rewriting using the Reasoning-First architecture.
-    Returns parsed JSON dict including 'thought_process', 'headline', 'summary', and 'body'.
-    Implements retry with exponential backoff for rate limits.
+    Supports multi-key rotation and intelligent rate-limit handling.
     """
     prompt = AI_REWRITE_PROMPT.format(title=title, content=content)
 
     for attempt in range(1, MAX_RETRIES + 1):
+        client, key_idx = key_manager.get_client()
+        
         try:
-            response = client.chat.completions.create(
+            # We use completions.with_raw_response to access rate limit headers
+            raw_response = client.chat.completions.with_raw_response.create(
                 model=GROQ_MODEL,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
@@ -499,10 +550,22 @@ def rewrite_article(client: Groq, title: str, content: str) -> Optional[dict]:
                 response_format={"type": "json_object"},
             )
 
-            raw_text = response.choices[0].message.content
+            # Check rate limit headers for proactive switching
+            headers = raw_response.headers
+            remaining_tokens = int(headers.get("x-ratelimit-remaining-tokens", 10000))
+            remaining_requests = int(headers.get("x-ratelimit-remaining-requests", 100))
+            
+            # If tokens are low (< 5000) or requests are low (< 2), rotate for next time
+            if remaining_tokens < 5000 or remaining_requests < 2:
+                log.info(f"   [KEY-INFO] Key #{key_idx} low on resources (Tokens: {remaining_tokens}, RPD: {remaining_requests}). Rotating...")
+                key_manager.current_index = (key_idx + 1) % len(key_manager.keys)
+
+            # Parse response
+            completion = raw_response.parse()
+            raw_text = completion.choices[0].message.content
 
             if not raw_text:
-                log.warning(f"   [WARN] Empty Groq response (attempt {attempt})")
+                log.warning(f"   [WARN] Empty Groq response (Key #{key_idx}, attempt {attempt})")
                 continue
 
             result = json.loads(raw_text)
@@ -521,26 +584,40 @@ def rewrite_article(client: Groq, title: str, content: str) -> Optional[dict]:
             if "body" in result:
                 result["body"] = result["body"].replace("NEWPARA", "\n\n").strip()
 
-            log.info(f"   [OK] Rewrite complete: \"{result.get('headline', '')[:60]}...\"")
+            log.info(f"   [OK] Rewrite complete (Key #{key_idx}): \"{result.get('headline', '')[:60]}...\"")
             return result
-
-        except json.JSONDecodeError as e:
-            log.warning(f"   [WARN] JSON parse error (attempt {attempt}): {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(2 ** attempt)
 
         except Exception as e:
             error_msg = str(e).lower()
-
+            
             # Handle rate limiting (429)
             if "429" in error_msg or "rate limit" in error_msg:
-                wait_time = min(60 * (2 ** attempt), 300)  # max 5 min wait
-                log.warning(f"   [RATE-LIMIT] Waiting {wait_time}s (attempt {attempt})...")
-                time.sleep(wait_time)
-            else:
-                log.error(f"   [ERROR] Groq error (attempt {attempt}): {e}")
-                if attempt < MAX_RETRIES:
-                    time.sleep(5 * attempt)
+                log.warning(f"   [RATE-LIMIT] Key #{key_idx} hit limit. Switching...")
+                
+                # Extract wait time if possible, otherwise default to 60s
+                wait_time = 60
+                if "retry-after" in error_msg:
+                    try:
+                        # Simple regex-less extraction for safety
+                        parts = error_msg.split("retry-after")[-1].split()
+                        for p in parts:
+                            if p.isdigit():
+                                wait_time = int(p)
+                                break
+                    except: pass
+                
+                key_manager.mark_cooldown(key_idx, wait_time)
+                # Retry immediately with a different key
+                continue 
+            
+            # Handle exhaustion (e.g., if we know RPD is 0)
+            if "daily limit" in error_msg:
+                key_manager.mark_exhausted(key_idx)
+                continue
+
+            log.error(f"   [ERROR] Groq error (Key #{key_idx}, attempt {attempt}): {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(2 * attempt)
 
     return None
 
@@ -609,7 +686,7 @@ def cleanup_old_data(sb: Client):
 
 # ─── Main Processing Loop ───────────────────────────────────────────────────
 
-def process_cycle(client: Groq, sb: Client, tracker: URLTracker) -> int:
+def process_cycle(key_manager: GroqKeyManager, sb: Client, tracker: URLTracker) -> int:
     """
     One full processing cycle:
     1. Fetch RSS feed and filter for new content
@@ -668,7 +745,7 @@ def process_cycle(client: Groq, sb: Client, tracker: URLTracker) -> int:
             log.info("   [INFO] Using RSS description as fallback content")
 
         # Step 2: Rewrite with AI
-        rewritten = rewrite_article(client, article["title"], content)
+        rewritten = rewrite_article(key_manager, article["title"], content)
 
         if not rewritten:
             log.warning("   [SKIP] Rewrite failed")
@@ -716,7 +793,7 @@ def main():
     """Main entry point - runs the agent loop 24/7."""
 
     log.info("=" * 60)
-    log.info(">>> Times of India Live News AI Agent Starting")
+    log.info(">>> AirNews Multi-Source AI Agent (V7.0) Starting")
     log.info("=" * 60)
     
     log.info(f"[CONFIG] Poll interval: {POLL_INTERVAL_SECONDS}s ({POLL_INTERVAL_SECONDS//60} min)")
@@ -725,7 +802,7 @@ def main():
     log.info("")
 
     # Initialize
-    client = init_ai()
+    key_manager = init_ai()
     sb = init_supabase()
     tracker = URLTracker(sb)
 
@@ -743,7 +820,7 @@ def main():
         log.info(f"{'---'*20}")
 
         try:
-            processed = process_cycle(client, sb, tracker)
+            processed = process_cycle(key_manager, sb, tracker)
             log.info(f"[DONE] Cycle #{cycle_count}: {processed} articles processed")
         except Exception as e:
             log.error(f"[ERROR] Cycle #{cycle_count}: {e}")
