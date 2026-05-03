@@ -1,20 +1,16 @@
 """
-AirNews AI Agent (V8.0 - Cerebras Migration)
+AirNews AI Agent (V8.5 - Cerebras Optimized)
 ========================================================
 Fetches RSS feeds from TOI, Times Now, NDTV, and The Hindu, scrapes full articles,
-rewrites them via Cerebras AI (Qwen 2.5 70B / 250B), and saves to Supabase.
-This version enforces a strict 'Hard News Only' policy for Indian content,
-blocking speculative political commentary, opinions, and features.
+pre-filters via Llama-8B, rewrites via Cerebras Qwen-235B, and saves to Supabase.
 
 Key Features:
-- Reasoning-First Architecture: Forces the AI to 'think' and disambiguate facts 
-  before writing.
-- Cerebras Integration: High-speed inference using the OpenAI-compatible SDK.
-- Strict Pacing: Enforces 1 RPM limit to stay within free-tier quotas.
-- Multi-Source Integration: Scrapes and parses content from major Indian news outlets.
-- Strict India News Filter: Automatically skips non-news content for the India category.
-
-Designed to run 24/7 within Cerebras API limits.
+- Reasoning-First Architecture: Forces Qwen to analyze situational context and projections.
+- Dual-Model Filtering: Uses Llama-3.1-8B for high-throughput scanning (30 RPM)
+  and Qwen-2.5-235B for high-quality editorial rewriting (1 RPM).
+- Strict 'Hard News Only' Policy: Blocks speculative political commentary and features.
+- Strict Pacing: Automatically sleeps for 180s after every successful Qwen rewrite.
+- Self-Healing: Gracefully handles API exhaustion without crashing.
 """
 
 import os
@@ -53,9 +49,8 @@ RSS_FEED_URLS = [
     {"url": "https://www.thehindu.com/news/international/feeder/default.rss", "category": "international", "name": "The Hindu International"}
 ]
 POLL_INTERVAL_SECONDS = 180          # 3 minutes between cycles (Strict 1 RPM)
-REQUEST_DELAY_SECONDS = 0            # No delay needed within cycle (1 article per cycle)
-MAX_ARTICLES_PER_CYCLE = 1          # Only process 1 article at a time
-DAILY_API_LIMIT = 1000               # Increased to reset blockage (previously 250)
+MAX_ARTICLES_PER_CYCLE = 25          # Scan up to 25 articles per cycle (mostly for filtering)
+DAILY_API_LIMIT = 250                # Protects token quota (approx 1M tokens/day)
 MAX_RETRIES = 3                      # retries on transient errors
 ARTICLE_FETCH_TIMEOUT = 15           # seconds for HTTP requests
 
@@ -107,22 +102,15 @@ AI_REWRITE_PROMPT = """Perform an advanced editorial analysis of the provided ne
 Your task is to produce a version that is authoritative, objective, and deeply insightful. It should provide a clear narrative of the events while situating them within their broader context and highlighting potential future outcomes.
 
 EDITORIAL REQUIREMENTS:
-1. Content Classification: Set 'is_news' to true ONLY if the content reports on a verified factual event that has already occurred or an official announcement/data release. This is critical for Indian content. Set to false (Article) for:
-   - Speculative political analysis (e.g., 'Entry sparks uncertainty', 'Future of X in doubt').
-   - Opinion pieces, editorials, and commentary.
-   - Stories focused on 'buzz', sentiment, or 'what-if' scenarios without a major new event.
-   - Lifestyle, listicles, advice, or general interest features.
+1. Content Insight: You are rewriting an article already verified as news. Focus on providing the executive summary and a detailed report.
 2. Balanced Vocabulary: Use professional, sophisticated English. Aim for clarity and precision.
 3. Narrative Flow & Outlook: Use the 'inverted pyramid' style for the lead, but ensure the closing sections provide an outlook on future implications or the logical next steps in the situation.
 4. Zero AI Clichés: DO NOT use repetitive AI phrases like "delving into," "testament to," "moreover," or "in conclusion."
 5. Fact Integrity: Ensure 100% factual accuracy. If a detail in the source seems incorrect or suspicious, omit it.
 6. Format: Create a strong, professional headline and a 2-3 sentence executive summary. The body should consist of 4+ distinct paragraphs separated by "NEWPARA".
 
-You MUST return ONLY a valid JSON object.
-Structure:
+Return ONLY a JSON object:
 {{
-  "is_news": boolean, (Strictly true for timely News, false for Features, Opinions, or general Articles. Be especially strict for India category)
-  "category": "india" or "international", (Determine based on the locations and entities mentioned)
   "thought_process": "Your deep analysis of the situation: Core facts, historical/global context, logical projections, and plan for an insightful rewrite.",
   "headline": "Professional headline",
   "summary": "Executive summary with contextual insight",
@@ -130,6 +118,7 @@ Structure:
   "tags": ["tag1", "tag2", "tag3", "tag4", "tag5"]
 }}
 
+Article Category: {category}
 Original Title: {title}
 Original Content: {content}
 """
@@ -286,6 +275,9 @@ def fetch_rss_feed() -> list[dict]:
                 if not clean_url or root_section in live_trash_sections or "/health/" in clean_url.lower() or "/offbeat/" in clean_url.lower():
                     continue
 
+                # Use RSS feed's category as the initial value (Llama will refine)
+                article_category = category
+
                 # Extract image URL — TOI uses <enclosure> tag, Times Now might use content
                 image_url = ""
                 if hasattr(entry, "media_content") and entry.media_content:
@@ -314,9 +306,6 @@ def fetch_rss_feed() -> list[dict]:
                 else:
                     clean_desc = ""
 
-                # All articles use AI category determination
-                article_category = "needs_ai"
-
                 all_articles.append({
                     "url": clean_url,
                     "title": entry.get("title", "").strip(),
@@ -326,7 +315,7 @@ def fetch_rss_feed() -> list[dict]:
                     "category": article_category
                 })
 
-            log.info(f"[RSS] Fetched {len(feed.entries)} articles from {feed_name} feed")
+            log.info(f"[RSS] Collected {len(all_articles)} valid articles from {feed_name} (after filtering)")
 
         except Exception as e:
             log.error(f"[ERROR] RSS fetch failed for {feed_url}: {e}")
@@ -337,8 +326,8 @@ def fetch_rss_feed() -> list[dict]:
 
 def scrape_article_content(url: str) -> Optional[str]:
     """
-    Scrape full article text from a Times of India article page.
-    Uses multiple fallback selectors to handle layout variations.
+    Scrape full article text from the source URL.
+    Supports TOI, The Hindu, NDTV, and Times Now using specialized selectors.
     """
     try:
         response = requests.get(
@@ -351,11 +340,9 @@ def scrape_article_content(url: str) -> Optional[str]:
         content_text = ""
 
         # Strategy 0: Extract from JSON-LD structured data (most reliable for TOI)
-        # TOI embeds full article text in <script type="application/ld+json">
         for ld_script in soup.find_all("script", type="application/ld+json"):
             try:
                 ld_data = json.loads(ld_script.text or "")
-                # Handle both single object and array
                 items = ld_data if isinstance(ld_data, list) else [ld_data]
                 for item in items:
                     if item.get("@type") in ("NewsArticle", "Article", "WebPage", "ReportageNewsArticle"):
@@ -435,7 +422,6 @@ def scrape_article_content(url: str) -> Optional[str]:
             )
 
         if content_text and len(content_text) > 100:
-            # Truncate very long articles to save tokens
             if len(content_text) > 5000:
                 content_text = content_text[:5000] + "..."
             log.info(f"   [SCRAPED] {len(content_text)} chars from article")
@@ -450,7 +436,6 @@ def scrape_article_content(url: str) -> Optional[str]:
         return None
 
     except Exception as e:
-        # Check if e has response and status_code for HTTPError equivalent
         if hasattr(e, "response") and hasattr(e.response, "status_code"):
             log.warning(f"   [WARN] HTTP {e.response.status_code} for {url}")
         else:
@@ -504,7 +489,15 @@ class AIKeyManager:
             
             self.current_index = (self.current_index + 1) % len(self.keys)
         
-        best_idx = min(self.cooldowns.keys(), key=lambda i: self.cooldowns[i])
+        # Self-Healing Check: If all keys are exhausted, sleep instead of crashing
+        active_keys = [i for i in range(len(self.keys)) if i not in self.exhausted]
+        if not active_keys:
+            log.error("[KEY-MANAGER] ALL KEYS EXHAUSTED. Sleeping for 1 hour before retrying...")
+            time.sleep(3600)
+            self.exhausted.clear() # Clear memory to give them a fresh attempt
+            return self.clients[0], 0
+            
+        best_idx = min(active_keys, key=lambda i: self.cooldowns[i])
         wait_time = max(0, self.cooldowns[best_idx] - now)
         if wait_time > 0:
             log.info(f"[KEY-MANAGER] All keys on cooldown. Waiting {int(wait_time)}s for Key #{best_idx}...")
@@ -549,7 +542,6 @@ def pre_filter_article(key_manager: AIKeyManager, title: str, content: str) -> O
         log.warning(f"   [WARN] Pre-filter failed ({e}). Proceeding to Qwen for safety.")
         return None
 
-
 def init_ai() -> AIKeyManager:
     """Initialize Cerebras Key Manager with keys from .env."""
     load_dotenv(BASE_DIR / ".env", override=True)
@@ -565,19 +557,17 @@ def init_ai() -> AIKeyManager:
     log.info(f"[AI] Initialized with {len(keys)} keys from .env. Model: {AI_MODEL}")
     return manager
 
-
-def rewrite_article(key_manager: AIKeyManager, title: str, content: str) -> Optional[dict]:
+def rewrite_article(key_manager: AIKeyManager, title: str, content: str, category: str) -> Optional[dict]:
     """
     Send article to Cerebras for analysis and rewriting.
     Uses strict rate-limit handling and JSON response extraction.
     """
-    prompt = AI_REWRITE_PROMPT.format(title=title, content=content)
+    prompt = AI_REWRITE_PROMPT.format(title=title, content=content, category=category)
 
     for attempt in range(1, MAX_RETRIES + 1):
         client, key_idx = key_manager.get_client()
         
         try:
-            # Using OpenAI SDK standard call
             response = client.chat.completions.create(
                 model=AI_MODEL,
                 messages=[
@@ -598,7 +588,7 @@ def rewrite_article(key_manager: AIKeyManager, title: str, content: str) -> Opti
             result = json.loads(raw_text)
 
             # Validate required keys
-            required = {"headline", "summary", "body", "is_news", "category"}
+            required = {"headline", "summary", "body"}
             if not required.issubset(result.keys()):
                 log.warning(f"   [WARN] Missing keys in response: {required - set(result.keys())}")
                 continue
@@ -631,15 +621,14 @@ def rewrite_article(key_manager: AIKeyManager, title: str, content: str) -> Opti
                     except: pass
                 
                 key_manager.mark_cooldown(key_idx, wait_time)
-                # Retry immediately with a different key
                 continue 
             
-            # Handle exhaustion (e.g., if we know RPD is 0)
+            # Handle exhaustion
             if "daily limit" in error_msg:
                 key_manager.mark_exhausted(key_idx)
                 continue
 
-            log.error(f"   [ERROR] Groq error (Key #{key_idx}, attempt {attempt}): {e}")
+            log.error(f"   [ERROR] Cerebras error (Key #{key_idx}, attempt {attempt}): {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(2 * attempt)
 
@@ -700,8 +689,6 @@ def cleanup_old_data(sb: Client):
     try:
         thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         
-        # We don't have exact counts of deleted rows via supabase-py easily without returning them,
-        # but we can execute the delete and rely on Supabase.
         sb.table("articles").delete().lt("processed_at", thirty_days_ago).execute()
         sb.table("visited_urls").delete().lt("visited_at", thirty_days_ago).execute()
         sb.table("ignored_articles").delete().lt("processed_at", thirty_days_ago).execute()
@@ -710,7 +697,7 @@ def cleanup_old_data(sb: Client):
 
 # ─── Main Processing Loop ───────────────────────────────────────────────────
 
-def process_cycle(key_manager: AIKeyManager, sb: Client, tracker: URLTracker) -> int:
+def process_cycle(key_manager: AIKeyManager, sb: Client, tracker: URLTracker) -> tuple[int, bool]:
     """
     One full processing cycle:
     1. Fetch RSS feed and filter for new content
@@ -719,33 +706,30 @@ def process_cycle(key_manager: AIKeyManager, sb: Client, tracker: URLTracker) ->
     4. Determine category (India vs International)
     5. Save to Supabase and track usage
     
-    Returns number of articles processed.
+    Returns (articles_processed, qwen_was_used).
     """
-    # Check daily quota
     daily_count = tracker.get_daily_count()
     if daily_count >= DAILY_API_LIMIT:
         log.info(f"[QUOTA] Daily limit reached ({daily_count}/{DAILY_API_LIMIT}). Waiting for reset.")
-        return 0
+        return 0, False
 
     remaining = DAILY_API_LIMIT - daily_count
 
-    # Fetch RSS
     articles = fetch_rss_feed()
     if not articles:
-        return 0
+        return 0, False
 
-    # Filter new articles
     new_articles = [a for a in articles if not tracker.is_visited(a["url"])]
 
     if not new_articles:
         log.info("[OK] No new articles to process")
-        return 0
+        return 0, False
 
     log.info(f"[NEW] Found {len(new_articles)} new articles (daily budget: {remaining} remaining)")
 
-    # Limit per cycle
     batch = new_articles[:min(MAX_ARTICLES_PER_CYCLE, remaining)]
     processed = 0
+    qwen_used = False
 
     for i, article in enumerate(batch, 1):
         if _shutdown_requested:
@@ -760,11 +744,10 @@ def process_cycle(key_manager: AIKeyManager, sb: Client, tracker: URLTracker) ->
         content = scrape_article_content(article["url"])
 
         if not content:
-            # Fallback: use RSS description if scraping fails
             content = article.get("description", "")
             if len(content) < 50:
                 log.warning("   [SKIP] No content available")
-                tracker.mark_visited(article["url"])  # mark to avoid retrying
+                tracker.mark_visited(article["url"]) 
                 continue
             log.info("   [INFO] Using RSS description as fallback content")
 
@@ -772,68 +755,51 @@ def process_cycle(key_manager: AIKeyManager, sb: Client, tracker: URLTracker) ->
         filter_result = pre_filter_article(key_manager, article["title"], content)
         
         if filter_result:
-            # Early exit for non-news
-            if not filter_result.get("is_news", True):
+            raw_is_news = filter_result.get("is_news", True)
+            if isinstance(raw_is_news, str):
+                is_news = str(raw_is_news).strip().lower() == "true"
+            else:
+                is_news = bool(raw_is_news)
+
+            if not is_news:
                 log.info(f"   [IGNORE] Non-news detected by pre-filter. Skipping...")
                 save_ignored_article_supabase(sb, article, {"thought_process": filter_result.get("reason", "")})
                 tracker.mark_visited(article["url"])
-                continue
+                # SAFETY DELAY: Prevents hitting Llama 30 RPM limit if batch is full of junk
+                time.sleep(2) 
+                continue 
             
-            # Apply AI-determined category early
             article["category"] = filter_result.get("category", "india")
 
         # Step 3: Rewrite with high-quality AI (Qwen)
-        rewritten = rewrite_article(key_manager, article["title"], content)
+        qwen_used = True 
+        rewritten = rewrite_article(key_manager, article["title"], content, article["category"])
         
-        # Step 4: Final checks and processing
-
         if not rewritten:
-            log.warning("   [SKIP] Rewrite failed")
-            # Don't mark as visited so we can retry next cycle
-            continue
+            log.warning("   [SKIP] Rewrite failed. Breaking cycle to protect Qwen rate limits.")
+            break 
 
-        # Use the AI-determined category
-        ai_determined_cat = rewritten.get("category", "india").lower()
-        if "international" in ai_determined_cat or "world" in ai_determined_cat:
-            article["category"] = "international"
-        else:
-            article["category"] = "india"
-
-        # Filter out non-news articles ONLY if category is india
-        if not rewritten.get("is_news", True) and article["category"] == "india":
-            log.info(f"   [IGNORE] Indian 'Article/Feature' detected. Skipping...")
-            save_ignored_article_supabase(sb, article, rewritten)
-            tracker.mark_visited(article["url"])
-            continue
-
-        if not rewritten.get("is_news", True) and article["category"] == "international":
-            log.info(f"   [PASS] International Article/Feature detected. Allowing per updated rules.")
-
-
-        # Step 3: Save to Supabase
+        # Step 4: Save to Supabase
         save_article_supabase(sb, article, rewritten)
 
-        # Step 4: Track
+        # Step 5: Track and End Cycle
         tracker.mark_visited(article["url"])
         tracker.increment_daily_count()
         processed += 1
+        
+        log.info(f"   [DONE] News processed. Ending cycle to respect 1 RPM limit.")
+        break
 
-        # Respect rate limits — wait between API calls
-        if i < len(batch):
-            log.info(f"   [WAIT] {REQUEST_DELAY_SECONDS}s before next article...")
-            time.sleep(REQUEST_DELAY_SECONDS)
-
-    # Clean up old data automatically (every cycle)
     cleanup_old_data(sb)
 
-    return processed
+    return processed, qwen_used
 
 
 def main():
     """Main entry point - runs the agent loop 24/7."""
 
     log.info("=" * 60)
-    log.info(">>> AirNews Cerebras AI Agent (V8.0) Starting")
+    log.info(">>> AirNews Cerebras AI Agent (V8.5) Starting")
     log.info("=" * 60)
     
     log.info(f"[CONFIG] Poll interval: {POLL_INTERVAL_SECONDS}s ({POLL_INTERVAL_SECONDS//60} min)")
@@ -841,7 +807,6 @@ def main():
     log.info(f"[CONFIG] Per-cycle max: {MAX_ARTICLES_PER_CYCLE} articles")
     log.info("")
 
-    # Initialize
     key_manager = init_ai()
     sb = init_supabase()
     tracker = URLTracker(sb)
@@ -860,19 +825,18 @@ def main():
         log.info(f"{'---'*20}")
 
         try:
-            processed = process_cycle(key_manager, sb, tracker)
+            processed, qwen_used = process_cycle(key_manager, sb, tracker)
             log.info(f"[DONE] Cycle #{cycle_count}: {processed} articles processed")
         except Exception as e:
             log.error(f"[ERROR] Cycle #{cycle_count}: {e}")
             log.error(traceback.format_exc())
+            qwen_used = True 
 
         if _shutdown_requested:
             break
 
-        # Smart sleep — longer if daily limit is reached
         daily_count = tracker.get_daily_count()
         if daily_count >= DAILY_API_LIMIT:
-            # Calculate seconds until midnight UTC
             now = datetime.now(timezone.utc)
             tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0)
             if tomorrow <= now:
@@ -880,10 +844,10 @@ def main():
             sleep_time = min((tomorrow - now).total_seconds() + 60, 3600)
             log.info(f"[SLEEP] Daily limit reached. Sleeping {int(sleep_time)}s until quota reset...")
         else:
-            sleep_time = POLL_INTERVAL_SECONDS
-            log.info(f"[SLEEP] Next check in {sleep_time}s...")
+            sleep_time = POLL_INTERVAL_SECONDS if qwen_used else 30
+            model_waited = "Qwen (180s)" if qwen_used else "Llama Scanner (30s)"
+            log.info(f"[SLEEP] Next check in {sleep_time}s for {model_waited}...")
 
-        # Interruptible sleep (check shutdown flag every second)
         for _ in range(int(sleep_time)):
             if _shutdown_requested:
                 break
@@ -893,7 +857,6 @@ def main():
     log.info(">>> Agent shut down gracefully")
     log.info(f"[STATS] Total articles processed: {tracker.total_articles}")
     log.info("=" * 60)
-
 
 if __name__ == "__main__":
     main()
