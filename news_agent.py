@@ -177,6 +177,16 @@ def init_supabase() -> Client:
         sys.exit(1)
     return create_client(url, key)
 
+def clean_url(url: str) -> str:
+    """Standardize URL cleaning: strip fragments (#) and query parameters (?)."""
+    if not url:
+        return ""
+    # Remove fragments
+    url = url.split("#")[0]
+    # Remove query parameters
+    url = url.split("?")[0]
+    return url.strip()
+
 # ─── URL Tracker (Supabase) ──────────────────────────────────────────────────
 
 class URLTracker:
@@ -191,22 +201,44 @@ class URLTracker:
 
     def _load(self):
         try:
-            # Fetch only recent visited URLs to avoid infinite memory growth
+            # Fetch recent visited URLs (using pagination to bypass 1000 row limit)
             thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-            response = self.sb.table("visited_urls").select("url").gte("visited_at", thirty_days_ago).execute()
-            for row in response.data:
-                self.visited.add(row["url"])
-            log.info(f"[TRACKER] Loaded {len(self.visited)} recent visited URLs from Supabase.")
+            
+            all_urls = []
+            limit = 1000
+            offset = 0
+            
+            while True:
+                response = self.sb.table("visited_urls") \
+                    .select("url") \
+                    .gte("visited_at", thirty_days_ago) \
+                    .range(offset, offset + limit - 1) \
+                    .execute()
+                
+                data = response.data
+                if not data:
+                    break
+                
+                all_urls.extend([row["url"] for row in data])
+                if len(data) < limit:
+                    break
+                offset += limit
+            
+            for url in all_urls:
+                self.visited.add(clean_url(url))
+                
+            log.info(f"[TRACKER] Loaded {len(self.visited)} recent visited URLs from Supabase (cleaned).")
         except Exception as e:
             log.error(f"[ERROR] Failed to load visited URLs from Supabase: {e}")
 
     def is_visited(self, url: str) -> bool:
-        return url in self.visited
+        return clean_url(url) in self.visited
 
     def mark_visited(self, url: str):
-        self.visited.add(url)
+        c_url = clean_url(url)
+        self.visited.add(c_url)
         try:
-            self.sb.table("visited_urls").insert({"url": url}).execute()
+            self.sb.table("visited_urls").insert({"url": c_url}).execute()
         except Exception as e:
             error_str = str(e)
             if "23505" not in error_str and "duplicate key" not in error_str:
@@ -251,13 +283,13 @@ def fetch_rss_feed() -> list[dict]:
                 continue
 
             for entry in feed.entries:
-                # Clean URL — remove tracking fragments
+                # Clean URL — remove tracking fragments and query parameters
                 raw_link = entry.get("link", "")
-                clean_url = raw_link.split("#")[0].strip()
+                article_url = clean_url(raw_link)
                 
                 try:
                     from urllib.parse import urlparse
-                    path_parts = urlparse(clean_url).path.strip("/").split("/")
+                    path_parts = urlparse(article_url).path.strip("/").split("/")
                     root_section = path_parts[0].lower() if path_parts else ""
                 except Exception:
                     root_section = ""
@@ -270,7 +302,7 @@ def fetch_rss_feed() -> list[dict]:
                     "cricket", "lifestyle", "astrology", "movies", "tv"
                 }
                 
-                if not clean_url or root_section in live_trash_sections or "/health/" in clean_url.lower() or "/offbeat/" in clean_url.lower():
+                if not article_url or root_section in live_trash_sections or "/health/" in article_url.lower() or "/offbeat/" in article_url.lower():
                     continue
 
                 # Use RSS feed's category as the initial value (Llama will refine)
@@ -305,7 +337,7 @@ def fetch_rss_feed() -> list[dict]:
                     clean_desc = ""
 
                 all_articles.append({
-                    "url": clean_url,
+                    "url": article_url,
                     "title": entry.get("title", "").strip(),
                     "description": clean_desc,
                     "published": entry.get("published", ""),
