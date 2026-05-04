@@ -478,19 +478,20 @@ AI_MODEL = "qwen-3-235b-a22b-instruct-2507"
 FILTER_MODEL = "llama3.1-8b"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
-PRE_FILTER_PROMPT = """Analyze this article and determine if it is a timely factual news event or a general interest article/feature.
+PRE_FILTER_PROMPT = """Analyze this article and determine if it is a factual news event or a high-quality analytical report.
 
 Criteria for 'is_news: true':
-- Timely reporting on a specific event that just occurred or is official.
-- Government announcements, policy releases, or legal rulings.
-- Geopolitical developments, disasters, or major factual events.
+- Timely reporting on a specific event (Government, Law, Conflict, Disasters).
+- OFFICIAL Indian news (Policy, Legal, Major Accidents).
+- INTERNATIONAL FLEXIBILITY: For international news, you may allow high-impact analytical reports, major scientific breakthroughs, or significant geopolitical features that provide global context.
 
 Criteria for 'is_news: false':
-- Speculative analysis, opinions, editorials, or "what if" scenarios.
-- Lifestyle, advice, listicles, or soft interest features.
-- Content that does not report on a specific, recent factual occurrence.
+- Low-quality gossip, viral social media memes, or celebrity rumors.
+- Lifestyle advice, listicles ("Top 10..."), or promotional fluff.
+- Fictional stories or purely speculative "what if" scenarios without factual basis.
+- For INDIA: Speculative political commentary or "opinions on why X happened" (India MUST be hard factual events only).
 
-IMPORTANT: Trust the source article's claims about events occurring NOW. Do NOT reject an article as 'is_news: false' just because the event is new to you or not in your training data. Assume the source is reporting a real-time event.
+IMPORTANT: Trust the source article's claims about events occurring NOW. Do NOT reject an article as 'is_news: false' just because the event is new to you.
 
 Return ONLY a JSON object:
 {{
@@ -499,6 +500,7 @@ Return ONLY a JSON object:
   "reason": "One sentence explanation"
 }}
 """
+
 
 class AIKeyManager:
     """Manages a pool of Cerebras API keys with intelligent rotation."""
