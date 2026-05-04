@@ -92,7 +92,7 @@ EDITORIAL PRINCIPLES:
    - Contextual Links: How does this relate to historical events or current global trends?
    - Logical Projections: What are the likely next steps, future implications, or potential outcomes of this news?
    - Situational Nuance: What are the secondary effects on society, markets, or geopolitics?
-6. FACT FILTERING & NOISE REDUCTION: If you detect that the source article contains factual errors, logical contradictions, or clearly incorrect data, do NOT include those errors. Intelligently filter out the "noise" and focus only on the verified core of the story.
+6. FACTUAL TRUST & NOISE REDUCTION: You are a news aggregator. Trust the provided source article as the primary source of truth for current events, even if the information is newer than your training data. Only filter out obvious promotional fluff, internal logical contradictions, or clearly nonsensical data. Do NOT reject news simply because you are "unaware" of the event.
 7. HARD NEWS FOCUS (INDIA): For Indian news, you must be extremely strict. Differentiate between a 'Hard News' event (e.g., 'A law was enacted', 'A major accident occurred', 'A policy was announced') and 'Articles/Features/Commentary' (e.g., 'The significance of X', 'Why Y happened', 'Opinions on Z'). Only classify factual, time-sensitive events as 'is_news' for India.
 8. INTERNATIONAL FLEXIBILITY: For international news, you may allow slightly broader features or analytical articles if they provide significant global context, but still prioritize hard news.
 """
@@ -106,7 +106,7 @@ EDITORIAL REQUIREMENTS:
 2. Balanced Vocabulary: Use professional, sophisticated English. Aim for clarity and precision.
 3. Narrative Flow & Outlook: Use the 'inverted pyramid' style for the lead, but ensure the closing sections provide an outlook on future implications or the logical next steps in the situation.
 4. Zero AI Clichés: DO NOT use repetitive AI phrases like "delving into," "testament to," "moreover," or "in conclusion."
-5. Fact Integrity: Ensure 100% factual accuracy. If a detail in the source seems incorrect or suspicious, omit it.
+5. Fact Integrity: Use the provided source article as the primary source of truth. Do not omit facts simply because they are recent or unknown to you. Only omit details that are clearly nonsensical or promotional spam.
 6. Format: Create a strong, professional headline and a 2-3 sentence executive summary. The body should consist of 4+ distinct paragraphs separated by "NEWPARA".
 
 Return ONLY a JSON object:
@@ -459,6 +459,8 @@ Criteria for 'is_news: false':
 - Speculative analysis, opinions, editorials, or "what if" scenarios.
 - Lifestyle, advice, listicles, or soft interest features.
 - Content that does not report on a specific, recent factual occurrence.
+
+IMPORTANT: Trust the source article's claims about events occurring NOW. Do NOT reject an article as 'is_news: false' just because the event is new to you or not in your training data. Assume the source is reporting a real-time event.
 
 Return ONLY a JSON object:
 {{
