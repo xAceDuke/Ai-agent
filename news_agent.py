@@ -40,7 +40,6 @@ BASE_DIR = Path(__file__).parent
 LOG_FILE = BASE_DIR / "agent.log"
 
 RSS_FEED_URLS = [
-    {"url": "https://timesofindia.indiatimes.com/rssfeeds/-2128936835.cms", "category": "india", "name": "TOI India"},
     {"url": "https://timesofindia.indiatimes.com/rssfeeds/296589292.cms", "category": "international", "name": "TOI International"},
     {"url": "https://www.timesnownews.com/feeds/gns-en-india.xml", "category": "india", "name": "Times Now India"},
     {"url": "https://feeds.feedburner.com/ndtvnews-india-news", "category": "india", "name": "NDTV India"},
