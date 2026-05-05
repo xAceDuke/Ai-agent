@@ -630,7 +630,7 @@ class OpenRouterMiddle:
                     self.mark_cooldown(60)
                     break 
                 log.warning(f"   [OPENROUTER-FILTER] Attempt {attempt} failed: {e}")
-                if attempt < MAX_RETRIES: time.sleep(2 * attempt)
+                if attempt < MAX_RETRIES: time.sleep(2)
         return None
 
     def rewrite(self, title: str, content: str, category: str) -> Optional[dict]:
@@ -683,7 +683,7 @@ class OpenRouterMiddle:
                         self.mark_cooldown(60)
                         break # Skip to next model if rate limited
                     log.warning(f"   [OPENROUTER-REWRITE] Attempt {attempt} with {model_id} failed: {e}")
-                    if attempt < model_retries: time.sleep(2 * attempt)
+                    if attempt < model_retries: time.sleep(2)
         return None
 
 class GeminiBackup:
