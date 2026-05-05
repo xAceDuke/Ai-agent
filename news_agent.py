@@ -495,8 +495,15 @@ CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 # OpenRouter (Middle Fallback — between Cerebras and Gemini)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_FILTER_MODEL = "openrouter/free"                       # Pre-filter (Safe free router)
-OPENROUTER_REWRITE_MODEL = "openrouter/free"               # Rewrite (Directly to free router)
-OPENROUTER_FREE_ROUTER = "openrouter/free"                          # Rewrite (fallback)
+
+# List of specific free models to try in order (V10.2 Model Chain)
+OPENROUTER_MODELS = [
+    "inclusionai/ling-2.6-1t:free",
+    "nvidia/nemotron-nano-9b-v2:free",
+    "minimax/minimax-m2.5:free",
+    "poolside/laguna-m.1:free",
+    "openrouter/free"
+]
 
 # Gemini (Backup — activated when ALL Cerebras and OpenRouter keys are exhausted)
 GEMINI_REWRITE_MODEL = "gemini-flash-latest"       # Capable enough for rewriting, huge free quota
@@ -583,7 +590,7 @@ class OpenRouterMiddle:
         self.client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
         self.available = True
         self.cooldown_until = 0
-        log.info(f"[OPENROUTER] Middle fallback initialized (filter={OPENROUTER_FILTER_MODEL}, rewrite={OPENROUTER_REWRITE_MODEL})")
+        log.info(f"[OPENROUTER] Middle fallback initialized with {len(OPENROUTER_MODELS)} models (filter={OPENROUTER_FILTER_MODEL})")
 
     def is_available(self) -> bool:
         """Check if OpenRouter is available (not on cooldown)."""
@@ -597,10 +604,8 @@ class OpenRouterMiddle:
         log.warning(f"[OPENROUTER] On cooldown for {seconds}s")
 
     def pre_filter(self, title: str, content: str) -> Optional[dict]:
-        """Pre-filter article using OpenRouter Llama-3.1-8B with retries."""
-        prompt = f"Title: {title}\n\nContent: {content[:2000]}"
-        
-        for attempt in range(1, MAX_RETRIES + 1):
+        # Pre-filter (Safe free router) - Only 1 retry for pre-filter to keep scan fast
+        for attempt in range(1, 2):
             try:
                 response = self.client.chat.completions.create(
                     model=OPENROUTER_FILTER_MODEL,
@@ -613,7 +618,7 @@ class OpenRouterMiddle:
                 )
                 raw_text = response.choices[0].message.content
                 if not raw_text:
-                    log.warning(f"   [OPENROUTER-FILTER] Empty response (attempt {attempt})")
+                    log.warning(f"   [OPENROUTER-FILTER] Empty response")
                     continue
                 result = clean_and_parse_json(raw_text)
                 log.info(f"   [FILTER] model={OPENROUTER_FILTER_MODEL} (middle) is_news={result.get('is_news')} cat={result.get('category')} reason={result.get('reason')}")
@@ -622,20 +627,21 @@ class OpenRouterMiddle:
                 error_msg = str(e).lower()
                 if "429" in error_msg or "rate limit" in error_msg:
                     self.mark_cooldown(60)
-                    break # Skip retries if rate limited
-                log.warning(f"   [OPENROUTER-FILTER] Attempt {attempt} failed: {e}")
-                if attempt < MAX_RETRIES: time.sleep(2 * attempt)
+                    break 
+                log.warning(f"   [OPENROUTER-FILTER] Failed: {e}")
         return None
 
     def rewrite(self, title: str, content: str, category: str) -> Optional[dict]:
         """Rewrite article using OpenRouter with retries per model."""
         prompt = AI_REWRITE_PROMPT.format(title=title, content=content, category=category)
         
-        models_to_try = [OPENROUTER_FREE_ROUTER]
+        models_to_try = OPENROUTER_MODELS
         
         for model_id in models_to_try:
-            log.info(f"   [OPENROUTER] Attempting rewrite with {model_id} (max {MAX_RETRIES} retries)...")
-            for attempt in range(1, MAX_RETRIES + 1):
+            # 5 retries for Laguna, 1 for others
+            model_retries = MAX_RETRIES if "laguna" in model_id else 1
+            log.info(f"   [OPENROUTER] Attempting rewrite with {model_id} (max {model_retries} retries)...")
+            for attempt in range(1, model_retries + 1):
                 try:
                     response = self.client.chat.completions.create(
                         model=model_id,
@@ -675,7 +681,7 @@ class OpenRouterMiddle:
                         self.mark_cooldown(60)
                         break # Skip to next model if rate limited
                     log.warning(f"   [OPENROUTER-REWRITE] Attempt {attempt} with {model_id} failed: {e}")
-                    if attempt < MAX_RETRIES: time.sleep(2 * attempt)
+                    if attempt < model_retries: time.sleep(2 * attempt)
         return None
 
 class GeminiBackup:
