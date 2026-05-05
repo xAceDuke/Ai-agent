@@ -62,7 +62,7 @@ RSS_FEED_URLS = [
     {"url": "https://www.thehindu.com/news/national/feeder/default.rss", "category": "india", "name": "The Hindu National"},
     {"url": "https://www.thehindu.com/news/international/feeder/default.rss", "category": "international", "name": "The Hindu International"}
 ]
-POLL_INTERVAL_SECONDS = 180          # 3 minutes between cycles (Strict 1 RPM)
+POLL_INTERVAL_SECONDS = 60           # 1 minute between cycles (Respects 1 RPM)
 MAX_ARTICLES_PER_CYCLE = 25          # Scan up to 25 articles per cycle (mostly for filtering)
 DAILY_API_LIMIT = 250                # Protects token quota (approx 1M tokens/day)
 MAX_RETRIES = 5                      # retries on transient errors (Upgraded to 5 for stability)
