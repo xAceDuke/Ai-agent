@@ -1,5 +1,5 @@
 """
-AirNews AI Agent (V8.5 - Cerebras Optimized)
+AirNews AI Agent (V9.0 - Cerebras + Gemini Failover)
 ========================================================
 Fetches RSS feeds from TOI, Times Now, NDTV, and The Hindu, scrapes full articles,
 pre-filters via Llama-8B, rewrites via Cerebras Qwen-235B, and saves to Supabase.
@@ -8,12 +8,15 @@ Key Features:
 - Reasoning-First Architecture: Forces Qwen to analyze situational context and projections.
 - Dual-Model Filtering: Uses Llama-3.1-8B for high-throughput scanning (30 RPM)
   and Qwen-2.5-235B for high-quality editorial rewriting (1 RPM).
+- Gemini Backup: Automatically falls back to Gemini 2.5 Pro (rewriting) and
+  Gemini 2.5 Flash (filtering) when Cerebras rate limits are exhausted.
 - Strict 'Hard News Only' Policy: Blocks speculative political commentary and features.
-- Strict Pacing: Automatically sleeps for 180s after every successful Qwen rewrite.
+- Strict Pacing: Automatically sleeps for 180s after every successful rewrite.
 - Self-Healing: Gracefully handles API exhaustion without crashing.
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -24,6 +27,7 @@ import traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import feedparser
 from curl_cffi import requests
@@ -31,12 +35,23 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from openai import OpenAI
+from google import genai
+from google.genai import types
 
 from supabase import create_client, Client
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 BASE_DIR = Path(__file__).parent
+
+def clean_and_parse_json(raw_text: str) -> dict:
+    """Safely extracts JSON from LLM outputs, stripping markdown formatting."""
+    text = raw_text.strip()
+    # Remove markdown code block syntax if present
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\n", "", text)
+        text = re.sub(r"\n```$", "", text)
+    return json.loads(text.strip())
 LOG_FILE = BASE_DIR / "agent.log"
 
 RSS_FEED_URLS = [
@@ -287,7 +302,6 @@ def fetch_rss_feed() -> list[dict]:
                 article_url = clean_url(raw_link)
                 
                 try:
-                    from urllib.parse import urlparse
                     path_parts = urlparse(article_url).path.strip("/").split("/")
                     root_section = path_parts[0].lower() if path_parts else ""
                 except Exception:
@@ -471,11 +485,16 @@ def scrape_article_content(url: str) -> Optional[str]:
             log.warning(f"   [WARN] Request failed for {url}: {e}")
         return None
 
-# ─── Cerebras AI Rewriter ─────────────────────────────────────────────────────
+# ─── AI Provider Configuration ────────────────────────────────────────────────
 
+# Cerebras (Primary)
 AI_MODEL = "qwen-3-235b-a22b-instruct-2507"
 FILTER_MODEL = "llama3.1-8b"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
+
+# Gemini (Backup — activated when ALL Cerebras keys are rate-limited)
+GEMINI_REWRITE_MODEL = "gemini-flash-latest"       # Capable enough for rewriting, huge free quota
+GEMINI_FILTER_MODEL = "gemini-flash-lite-latest"   # Lightning fast for true/false pre-filter
 
 PRE_FILTER_PROMPT = """Analyze this article and determine if it is a factual news event or a high-quality analytical report.
 
@@ -549,10 +568,105 @@ class AIKeyManager:
         self.exhausted.add(index)
         log.error(f"[KEY-MANAGER] Key #{index} EXHAUSTED for the day.")
 
-def pre_filter_article(key_manager: AIKeyManager, title: str, content: str) -> Optional[dict]:
+# ─── Gemini Backup Provider ───────────────────────────────────────────────────
+
+class GeminiBackup:
+    """Google Gemini backup provider — activated when Cerebras is rate-limited."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.client = genai.Client(api_key=api_key)
+        self.available = True
+        self.cooldown_until = 0
+        log.info(f"[GEMINI] Backup provider initialized (rewrite={GEMINI_REWRITE_MODEL}, filter={GEMINI_FILTER_MODEL})")
+
+    def is_available(self) -> bool:
+        """Check if Gemini is available (not on cooldown)."""
+        if not self.available:
+            return False
+        if time.time() < self.cooldown_until:
+            return False
+        return True
+
+    def mark_cooldown(self, seconds: int = 60):
+        """Put Gemini on cooldown after a rate-limit hit."""
+        self.cooldown_until = time.time() + seconds
+        log.warning(f"[GEMINI] On cooldown for {seconds}s")
+
+    def pre_filter(self, title: str, content: str) -> Optional[dict]:
+        """Pre-filter article using Gemini 2.5 Flash."""
+        prompt = f"{PRE_FILTER_PROMPT}\n\nTitle: {title}\n\nContent: {content[:2000]}"
+        try:
+            response = self.client.models.generate_content(
+                model=GEMINI_FILTER_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                ),
+            )
+            raw_text = response.text
+            if not raw_text:
+                log.warning("   [GEMINI-FILTER] Empty response")
+                return None
+            result = clean_and_parse_json(raw_text)
+            log.info(f"   [FILTER] model={GEMINI_FILTER_MODEL} (backup) is_news={result.get('is_news')} cat={result.get('category')} reason={result.get('reason')}")
+            return result
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "429" in error_msg or "resource_exhausted" in error_msg or "rate" in error_msg:
+                self.mark_cooldown(60)
+            log.warning(f"   [GEMINI-FILTER] Backup filter failed: {e}")
+            return None
+
+    def rewrite(self, title: str, content: str, category: str) -> Optional[dict]:
+        """Rewrite article using Gemini 2.5 Pro."""
+        prompt = f"{SYSTEM_PROMPT}\n\n{AI_REWRITE_PROMPT.format(title=title, content=content, category=category)}"
+        try:
+            response = self.client.models.generate_content(
+                model=GEMINI_REWRITE_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.7,
+                    max_output_tokens=3000,
+                ),
+            )
+            raw_text = response.text
+            if not raw_text:
+                log.warning("   [GEMINI-REWRITE] Empty response")
+                return None
+
+            result = clean_and_parse_json(raw_text)
+
+            # Validate required keys
+            required = {"headline", "summary", "body"}
+            if not required.issubset(result.keys()):
+                log.warning(f"   [GEMINI-REWRITE] Missing keys: {required - set(result.keys())}")
+                return None
+
+            # Log thought process
+            thought = result.get("thought_process", "No thought process provided.")
+            log.info(f"   [THOUGHT] {thought[:200]}...")
+
+            # Convert NEWPARA markers
+            if "body" in result:
+                result["body"] = result["body"].replace("NEWPARA", "\n\n").strip()
+
+            log.info(f"   [OK] Gemini rewrite complete: \"{result.get('headline', '')[:60]}...\"")
+            return result
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "429" in error_msg or "resource_exhausted" in error_msg or "rate" in error_msg:
+                self.mark_cooldown(60)
+            log.error(f"   [GEMINI-REWRITE] Backup rewrite failed: {e}")
+            return None
+
+
+def pre_filter_article(key_manager: 'AIKeyManager', title: str, content: str, gemini: Optional['GeminiBackup'] = None) -> Optional[dict]:
     """
     Perform quick pre-filtering using a smaller model to save Qwen usage.
-    Determines category and whether the article is hard news.
+    Falls back to Gemini 2.5 Flash if Cerebras fails.
     """
     prompt = f"Title: {title}\n\nContent: {content[:2000]}" # Truncate for pre-filter
     
@@ -568,15 +682,25 @@ def pre_filter_article(key_manager: AIKeyManager, title: str, content: str) -> O
             response_format={"type": "json_object"},
         )
         raw_text = response.choices[0].message.content
-        result = json.loads(raw_text)
+        result = clean_and_parse_json(raw_text)
         log.info(f"   [FILTER] model={FILTER_MODEL} is_news={result.get('is_news')} cat={result.get('category')} reason={result.get('reason')}")
         return result
     except Exception as e:
-        log.warning(f"   [WARN] Pre-filter failed ({e}). Proceeding to Qwen for safety.")
+        error_msg = str(e).lower()
+        if "429" in error_msg or "rate limit" in error_msg:
+            key_manager.mark_cooldown(key_idx, 60)
+        log.warning(f"   [WARN] Cerebras pre-filter failed ({e}).")
+
+        # ── Gemini Fallback ──
+        if gemini and gemini.is_available():
+            log.info(f"   [FALLBACK] Switching to {GEMINI_FILTER_MODEL} for pre-filter...")
+            return gemini.pre_filter(title, content)
+
+        log.warning("   [WARN] No backup available. Proceeding to rewrite for safety.")
         return None
 
-def init_ai() -> AIKeyManager:
-    """Initialize Cerebras Key Manager with keys from .env."""
+def init_ai() -> tuple['AIKeyManager', Optional['GeminiBackup']]:
+    """Initialize Cerebras Key Manager and Gemini Backup from .env."""
     load_dotenv(BASE_DIR / ".env", override=True)
     keys_str = os.getenv("CEREBRAS_API_KEYS", "")
     
@@ -587,16 +711,29 @@ def init_ai() -> AIKeyManager:
         sys.exit(1)
         
     manager = AIKeyManager(keys)
-    log.info(f"[AI] Initialized with {len(keys)} keys from .env. Model: {AI_MODEL}")
-    return manager
+    log.info(f"[AI] Cerebras initialized with {len(keys)} keys. Primary model: {AI_MODEL}")
 
-def rewrite_article(key_manager: AIKeyManager, title: str, content: str, category: str) -> Optional[dict]:
+    # Initialize Gemini backup
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    gemini = None
+    if gemini_key:
+        try:
+            gemini = GeminiBackup(gemini_key)
+        except Exception as e:
+            log.warning(f"[WARN] Gemini backup init failed: {e}. Continuing without backup.")
+    else:
+        log.warning("[WARN] No GEMINI_API_KEY in .env. Running without Gemini backup.")
+
+    return manager, gemini
+
+def rewrite_article(key_manager: 'AIKeyManager', title: str, content: str, category: str, gemini: Optional['GeminiBackup'] = None) -> Optional[dict]:
     """
     Send article to Cerebras for analysis and rewriting.
-    Uses strict rate-limit handling and JSON response extraction.
+    Falls back to Gemini 2.5 Pro if all Cerebras retries fail.
     """
     prompt = AI_REWRITE_PROMPT.format(title=title, content=content, category=category)
 
+    cerebras_failed = False
     for attempt in range(1, MAX_RETRIES + 1):
         client, key_idx = key_manager.get_client()
         
@@ -618,7 +755,7 @@ def rewrite_article(key_manager: AIKeyManager, title: str, content: str, categor
                 log.warning(f"   [WARN] Empty response (Key #{key_idx}, attempt {attempt})")
                 continue
 
-            result = json.loads(raw_text)
+            result = clean_and_parse_json(raw_text)
 
             # Validate required keys
             required = {"headline", "summary", "body"}
@@ -654,16 +791,34 @@ def rewrite_article(key_manager: AIKeyManager, title: str, content: str, categor
                     except: pass
                 
                 key_manager.mark_cooldown(key_idx, wait_time)
+                cerebras_failed = True
+
+                # If Gemini backup is available, skip waiting on cooldown keys — fallback NOW
+                if gemini and gemini.is_available():
+                    log.info(f"   [FALLBACK] Gemini available — skipping Cerebras cooldown wait.")
+                    break
                 continue 
             
             # Handle exhaustion
             if "daily limit" in error_msg:
                 key_manager.mark_exhausted(key_idx)
+                cerebras_failed = True
+
+                # If Gemini backup is available, skip waiting — fallback NOW
+                if gemini and gemini.is_available():
+                    log.info(f"   [FALLBACK] Gemini available — skipping exhausted Cerebras keys.")
+                    break
                 continue
 
             log.error(f"   [ERROR] Cerebras error (Key #{key_idx}, attempt {attempt}): {e}")
+            cerebras_failed = True
             if attempt < MAX_RETRIES:
                 time.sleep(2 * attempt)
+
+    # ── Gemini Fallback ──
+    if cerebras_failed and gemini and gemini.is_available():
+        log.info(f"   [FALLBACK] All Cerebras keys failed. Switching to {GEMINI_REWRITE_MODEL}...")
+        return gemini.rewrite(title, content, category)
 
     return None
 
@@ -730,16 +885,16 @@ def cleanup_old_data(sb: Client):
 
 # ─── Main Processing Loop ───────────────────────────────────────────────────
 
-def process_cycle(key_manager: AIKeyManager, sb: Client, tracker: URLTracker) -> tuple[int, bool]:
+def process_cycle(key_manager: 'AIKeyManager', sb: Client, tracker: URLTracker, gemini: Optional['GeminiBackup'] = None) -> tuple[int, bool]:
     """
     One full processing cycle:
     1. Fetch RSS feed and filter for new content
     2. Scrape full article body
-    3. Analyze and rewrite using Cerebras AI (Reasoning Step)
+    3. Analyze and rewrite using Cerebras/Gemini AI (Reasoning Step)
     4. Determine category (India vs International)
     5. Save to Supabase and track usage
     
-    Returns (articles_processed, qwen_was_used).
+    Returns (articles_processed, rewrite_model_was_used).
     """
     daily_count = tracker.get_daily_count()
     if daily_count >= DAILY_API_LIMIT:
@@ -784,8 +939,8 @@ def process_cycle(key_manager: AIKeyManager, sb: Client, tracker: URLTracker) ->
                 continue
             log.info("   [INFO] Using RSS description as fallback content")
 
-        # Step 2: Pre-filter with smaller model
-        filter_result = pre_filter_article(key_manager, article["title"], content)
+        # Step 2: Pre-filter with smaller model (Cerebras Llama → Gemini Flash fallback)
+        filter_result = pre_filter_article(key_manager, article["title"], content, gemini=gemini)
         
         if filter_result:
             raw_is_news = filter_result.get("is_news", True)
@@ -804,9 +959,9 @@ def process_cycle(key_manager: AIKeyManager, sb: Client, tracker: URLTracker) ->
             
             article["category"] = filter_result.get("category", "india")
 
-        # Step 3: Rewrite with high-quality AI (Qwen)
+        # Step 3: Rewrite with high-quality AI (Cerebras Qwen → Gemini Pro fallback)
         qwen_used = True 
-        rewritten = rewrite_article(key_manager, article["title"], content, article["category"])
+        rewritten = rewrite_article(key_manager, article["title"], content, article["category"], gemini=gemini)
         
         if not rewritten:
             log.warning("   [SKIP] Rewrite failed. Breaking cycle to protect Qwen rate limits.")
@@ -832,15 +987,16 @@ def main():
     """Main entry point - runs the agent loop 24/7."""
 
     log.info("=" * 60)
-    log.info(">>> AirNews Cerebras AI Agent (V8.5) Starting")
+    log.info(">>> AirNews AI Agent (V9.0 - Cerebras + Gemini Failover) Starting")
     log.info("=" * 60)
     
     log.info(f"[CONFIG] Poll interval: {POLL_INTERVAL_SECONDS}s ({POLL_INTERVAL_SECONDS//60} min)")
     log.info(f"[CONFIG] Daily limit:   {DAILY_API_LIMIT} articles")
     log.info(f"[CONFIG] Per-cycle max: {MAX_ARTICLES_PER_CYCLE} articles")
+    log.info(f"[CONFIG] Backup:        Gemini Flash + Flash-Lite")
     log.info("")
 
-    key_manager = init_ai()
+    key_manager, gemini = init_ai()
     sb = init_supabase()
     tracker = URLTracker(sb)
 
@@ -858,7 +1014,7 @@ def main():
         log.info(f"{'---'*20}")
 
         try:
-            processed, qwen_used = process_cycle(key_manager, sb, tracker)
+            processed, qwen_used = process_cycle(key_manager, sb, tracker, gemini=gemini)
             log.info(f"[DONE] Cycle #{cycle_count}: {processed} articles processed")
         except Exception as e:
             log.error(f"[ERROR] Cycle #{cycle_count}: {e}")
@@ -873,7 +1029,7 @@ def main():
             now = datetime.now(timezone.utc)
             tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0)
             if tomorrow <= now:
-                tomorrow = tomorrow.replace(day=now.day + 1)
+                tomorrow = tomorrow + timedelta(days=1)
             sleep_time = min((tomorrow - now).total_seconds() + 60, 3600)
             log.info(f"[SLEEP] Daily limit reached. Sleeping {int(sleep_time)}s until quota reset...")
         else:
