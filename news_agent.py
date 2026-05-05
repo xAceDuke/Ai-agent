@@ -1,5 +1,5 @@
 """
-AirNews AI Agent (V9.0 - Cerebras + Gemini Failover)
+AirNews AI Agent (V10.1 - Cerebras + OpenRouter + Gemini Fallback)
 ========================================================
 Fetches RSS feeds from TOI, Times Now, NDTV, and The Hindu, scrapes full articles,
 pre-filters via Llama-8B, rewrites via Cerebras Qwen-235B, and saves to Supabase.
@@ -8,8 +8,8 @@ Key Features:
 - Reasoning-First Architecture: Forces Qwen to analyze situational context and projections.
 - Dual-Model Filtering: Uses Llama-3.1-8B for high-throughput scanning (30 RPM)
   and Qwen-2.5-235B for high-quality editorial rewriting (1 RPM).
-- Gemini Backup: Automatically falls back to Gemini 2.5 Pro (rewriting) and
-  Gemini 2.5 Flash (filtering) when Cerebras rate limits are exhausted.
+- Multi-Tier Fallback: Falls back to OpenRouter (free) and then Gemini 2.5 Pro (rewriting)
+  and Gemini 2.5 Flash (filtering) when Cerebras rate limits are exhausted.
 - Strict 'Hard News Only' Policy: Blocks speculative political commentary and features.
 - Strict Pacing: Automatically sleeps for 180s after every successful rewrite.
 - Self-Healing: Gracefully handles API exhaustion without crashing.
@@ -65,7 +65,7 @@ RSS_FEED_URLS = [
 POLL_INTERVAL_SECONDS = 180          # 3 minutes between cycles (Strict 1 RPM)
 MAX_ARTICLES_PER_CYCLE = 25          # Scan up to 25 articles per cycle (mostly for filtering)
 DAILY_API_LIMIT = 250                # Protects token quota (approx 1M tokens/day)
-MAX_RETRIES = 3                      # retries on transient errors
+MAX_RETRIES = 5                      # retries on transient errors (Upgraded to 5 for stability)
 ARTICLE_FETCH_TIMEOUT = 15           # seconds for HTTP requests
 
 # ─── Cerebras API Key Pool ────────────────────────────────────────────────────────
@@ -76,7 +76,7 @@ HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/126.0.0.0 Safari/537.36"
+        "Chrome/126.0.0.0 Safari/126.0.0.0"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
@@ -492,7 +492,13 @@ AI_MODEL = "qwen-3-235b-a22b-instruct-2507"
 FILTER_MODEL = "llama3.1-8b"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
-# Gemini (Backup — activated when ALL Cerebras keys are rate-limited)
+# OpenRouter (Middle Fallback — between Cerebras and Gemini)
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_FILTER_MODEL = "openrouter/free"                       # Pre-filter (Safe free router)
+OPENROUTER_REWRITE_MODEL = "openrouter/free"               # Rewrite (Directly to free router)
+OPENROUTER_FREE_ROUTER = "openrouter/free"                          # Rewrite (fallback)
+
+# Gemini (Backup — activated when ALL Cerebras and OpenRouter keys are exhausted)
 GEMINI_REWRITE_MODEL = "gemini-flash-latest"       # Capable enough for rewriting, huge free quota
 GEMINI_FILTER_MODEL = "gemini-flash-lite-latest"   # Lightning fast for true/false pre-filter
 
@@ -568,10 +574,112 @@ class AIKeyManager:
         self.exhausted.add(index)
         log.error(f"[KEY-MANAGER] Key #{index} EXHAUSTED for the day.")
 
-# ─── Gemini Backup Provider ───────────────────────────────────────────────────
+# ─── Middle-Tier & Gemini Backup Providers ───────────────────────────────────
+
+class OpenRouterMiddle:
+    """OpenRouter middle-tier fallback — sits between Cerebras and Gemini."""
+
+    def __init__(self, api_key: str):
+        self.client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
+        self.available = True
+        self.cooldown_until = 0
+        log.info(f"[OPENROUTER] Middle fallback initialized (filter={OPENROUTER_FILTER_MODEL}, rewrite={OPENROUTER_REWRITE_MODEL})")
+
+    def is_available(self) -> bool:
+        """Check if OpenRouter is available (not on cooldown)."""
+        if not self.available:
+            return False
+        return time.time() >= self.cooldown_until
+
+    def mark_cooldown(self, seconds: int = 60):
+        """Put OpenRouter on cooldown after a rate-limit hit."""
+        self.cooldown_until = time.time() + seconds
+        log.warning(f"[OPENROUTER] On cooldown for {seconds}s")
+
+    def pre_filter(self, title: str, content: str) -> Optional[dict]:
+        """Pre-filter article using OpenRouter Llama-3.1-8B with retries."""
+        prompt = f"Title: {title}\n\nContent: {content[:2000]}"
+        
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=OPENROUTER_FILTER_MODEL,
+                    messages=[
+                        {"role": "system", "content": PRE_FILTER_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                )
+                raw_text = response.choices[0].message.content
+                if not raw_text:
+                    log.warning(f"   [OPENROUTER-FILTER] Empty response (attempt {attempt})")
+                    continue
+                result = clean_and_parse_json(raw_text)
+                log.info(f"   [FILTER] model={OPENROUTER_FILTER_MODEL} (middle) is_news={result.get('is_news')} cat={result.get('category')} reason={result.get('reason')}")
+                return result
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "429" in error_msg or "rate limit" in error_msg:
+                    self.mark_cooldown(60)
+                    break # Skip retries if rate limited
+                log.warning(f"   [OPENROUTER-FILTER] Attempt {attempt} failed: {e}")
+                if attempt < MAX_RETRIES: time.sleep(2 * attempt)
+        return None
+
+    def rewrite(self, title: str, content: str, category: str) -> Optional[dict]:
+        """Rewrite article using OpenRouter with retries per model."""
+        prompt = AI_REWRITE_PROMPT.format(title=title, content=content, category=category)
+        
+        models_to_try = [OPENROUTER_FREE_ROUTER]
+        
+        for model_id in models_to_try:
+            log.info(f"   [OPENROUTER] Attempting rewrite with {model_id} (max {MAX_RETRIES} retries)...")
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    response = self.client.chat.completions.create(
+                        model=model_id,
+                        messages=[
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.7,
+                        max_tokens=3000,
+                        response_format={"type": "json_object"},
+                    )
+                    raw_text = response.choices[0].message.content
+                    if not raw_text:
+                        log.warning(f"   [OPENROUTER-REWRITE] Empty response from {model_id} (attempt {attempt})")
+                        continue
+
+                    result = clean_and_parse_json(raw_text)
+                    required = {"headline", "summary", "body"}
+                    if not required.issubset(result.keys()):
+                        log.warning(f"   [OPENROUTER-REWRITE] Missing keys from {model_id} (attempt {attempt})")
+                        continue
+
+                    # Log thought process
+                    thought = result.get("thought_process", "No thought process provided.")
+                    log.info(f"   [THOUGHT] {thought[:200]}...")
+
+                    # Convert NEWPARA markers
+                    if "body" in result:
+                        result["body"] = result["body"].replace("NEWPARA", "\n\n").strip()
+
+                    log.info(f"   [OK] OpenRouter rewrite complete ({model_id}): \"{result.get('headline', '')[:60]}...\"")
+                    return result
+
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "429" in error_msg or "rate limit" in error_msg:
+                        self.mark_cooldown(60)
+                        break # Skip to next model if rate limited
+                    log.warning(f"   [OPENROUTER-REWRITE] Attempt {attempt} with {model_id} failed: {e}")
+                    if attempt < MAX_RETRIES: time.sleep(2 * attempt)
+        return None
 
 class GeminiBackup:
-    """Google Gemini backup provider — activated when Cerebras is rate-limited."""
+    """Google Gemini backup provider — activated when Cerebras and OpenRouter are rate-limited."""
 
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -652,55 +760,72 @@ class GeminiBackup:
             # Convert NEWPARA markers
             if "body" in result:
                 result["body"] = result["body"].replace("NEWPARA", "\n\n").strip()
-
-            log.info(f"   [OK] Gemini rewrite complete: \"{result.get('headline', '')[:60]}...\"")
+            
             return result
         except Exception as e:
             error_msg = str(e).lower()
             if "429" in error_msg or "resource_exhausted" in error_msg or "rate" in error_msg:
                 self.mark_cooldown(60)
-            log.error(f"   [GEMINI-REWRITE] Backup rewrite failed: {e}")
+            log.error(f"   [GEMINI-REWRITE] Failed: {e}")
             return None
 
-
-def pre_filter_article(key_manager: 'AIKeyManager', title: str, content: str, gemini: Optional['GeminiBackup'] = None) -> Optional[dict]:
+def pre_filter_article(key_manager: 'AIKeyManager', title: str, content: str, openrouter: Optional['OpenRouterMiddle'] = None, gemini: Optional['GeminiBackup'] = None) -> Optional[dict]:
     """
     Perform quick pre-filtering using a smaller model to save Qwen usage.
-    Falls back to Gemini 2.5 Flash if Cerebras fails.
+    Falls back to OpenRouter then Gemini 2.5 Flash if Cerebras fails.
     """
-    prompt = f"Title: {title}\n\nContent: {content[:2000]}" # Truncate for pre-filter
+    prompt = f"Title: {title}\n\nContent: {content[:2000]}"
     
-    client, key_idx = key_manager.get_client()
-    try:
-        response = client.chat.completions.create(
-            model=FILTER_MODEL,
-            messages=[
-                {"role": "system", "content": PRE_FILTER_PROMPT},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1, # Lower temperature for classification
-            response_format={"type": "json_object"},
-        )
-        raw_text = response.choices[0].message.content
-        result = clean_and_parse_json(raw_text)
-        log.info(f"   [FILTER] model={FILTER_MODEL} is_news={result.get('is_news')} cat={result.get('category')} reason={result.get('reason')}")
-        return result
-    except Exception as e:
-        error_msg = str(e).lower()
-        if "429" in error_msg or "rate limit" in error_msg:
-            key_manager.mark_cooldown(key_idx, 60)
-        log.warning(f"   [WARN] Cerebras pre-filter failed ({e}).")
+    cerebras_failed = False
+    
+    # Quick check: Are all Cerebras keys on cooldown?
+    now = time.time()
+    any_available = any(i not in key_manager.exhausted and now >= key_manager.cooldowns[i] for i in range(len(key_manager.keys)))
+    
+    if not any_available:
+        log.warning("   [AI] All Cerebras keys on cooldown/exhausted. Skipping to fallbacks for pre-filter.")
+        cerebras_failed = True
+    else:
+        client, key_idx = key_manager.get_client()
+        try:
+            response = client.chat.completions.create(
+                model=FILTER_MODEL,
+                messages=[
+                    {"role": "system", "content": PRE_FILTER_PROMPT},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+            raw_text = response.choices[0].message.content
+            result = clean_and_parse_json(raw_text)
+            log.info(f"   [FILTER] model={FILTER_MODEL} is_news={result.get('is_news')} cat={result.get('category')} reason={result.get('reason')}")
+            return result
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "429" in error_msg or "rate limit" in error_msg:
+                key_manager.mark_cooldown(key_idx, 60)
+            log.warning(f"   [WARN] Cerebras pre-filter failed ({e}).")
+            cerebras_failed = True
 
-        # ── Gemini Fallback ──
-        if gemini and gemini.is_available():
-            log.info(f"   [FALLBACK] Switching to {GEMINI_FILTER_MODEL} for pre-filter...")
-            return gemini.pre_filter(title, content)
+    # ── OpenRouter Fallback ──
+    if cerebras_failed and openrouter and openrouter.is_available():
+        log.info(f"   [FALLBACK] Switching to OpenRouter for pre-filter...")
+        res = openrouter.pre_filter(title, content)
+        if res:
+            return res
+        log.warning("   [OPENROUTER] Middle filter returned no result. Falling back to Gemini...")
 
-        log.warning("   [WARN] No backup available. Proceeding to rewrite for safety.")
-        return None
+    # ── Gemini Fallback ──
+    if cerebras_failed and gemini and gemini.is_available():
+        log.info(f"   [FALLBACK] Switching to {GEMINI_FILTER_MODEL} for pre-filter...")
+        return gemini.pre_filter(title, content)
 
-def init_ai() -> tuple['AIKeyManager', Optional['GeminiBackup']]:
-    """Initialize Cerebras Key Manager and Gemini Backup from .env."""
+    log.warning("   [WARN] No backup available. Proceeding to rewrite for safety.")
+    return None
+
+def init_ai() -> tuple['AIKeyManager', Optional['OpenRouterMiddle'], Optional['GeminiBackup']]:
+    """Initialize Cerebras Key Manager, OpenRouter, and Gemini Backup from .env."""
     load_dotenv(BASE_DIR / ".env", override=True)
     keys_str = os.getenv("CEREBRAS_API_KEYS", "")
     
@@ -713,6 +838,17 @@ def init_ai() -> tuple['AIKeyManager', Optional['GeminiBackup']]:
     manager = AIKeyManager(keys)
     log.info(f"[AI] Cerebras initialized with {len(keys)} keys. Primary model: {AI_MODEL}")
 
+    # Initialize OpenRouter middle fallback
+    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    openrouter = None
+    if openrouter_key:
+        try:
+            openrouter = OpenRouterMiddle(openrouter_key)
+        except Exception as e:
+            log.warning(f"[WARN] OpenRouter middle fallback init failed: {e}")
+    else:
+        log.warning("[WARN] No OPENROUTER_API_KEY in .env. Running without OpenRouter middle fallback.")
+
     # Initialize Gemini backup
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
     gemini = None
@@ -724,100 +860,108 @@ def init_ai() -> tuple['AIKeyManager', Optional['GeminiBackup']]:
     else:
         log.warning("[WARN] No GEMINI_API_KEY in .env. Running without Gemini backup.")
 
-    return manager, gemini
+    return manager, openrouter, gemini
 
-def rewrite_article(key_manager: 'AIKeyManager', title: str, content: str, category: str, gemini: Optional['GeminiBackup'] = None) -> Optional[dict]:
+def rewrite_article(key_manager: 'AIKeyManager', title: str, content: str, category: str, openrouter: Optional['OpenRouterMiddle'] = None, gemini: Optional['GeminiBackup'] = None) -> Optional[dict]:
     """
     Send article to Cerebras for analysis and rewriting.
-    Falls back to Gemini 2.5 Pro if all Cerebras retries fail.
+    Falls back to OpenRouter Qwen-235B/Free, then Gemini 2.5 Pro if all fail.
     """
     prompt = AI_REWRITE_PROMPT.format(title=title, content=content, category=category)
 
     cerebras_failed = False
-    for attempt in range(1, MAX_RETRIES + 1):
-        client, key_idx = key_manager.get_client()
-        
-        try:
-            response = client.chat.completions.create(
-                model=AI_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-                max_tokens=3000,
-                response_format={"type": "json_object"},
-            )
-
-            raw_text = response.choices[0].message.content
-
-            if not raw_text:
-                log.warning(f"   [WARN] Empty response (Key #{key_idx}, attempt {attempt})")
-                continue
-
-            result = clean_and_parse_json(raw_text)
-
-            # Validate required keys
-            required = {"headline", "summary", "body"}
-            if not required.issubset(result.keys()):
-                log.warning(f"   [WARN] Missing keys in response: {required - set(result.keys())}")
-                continue
-
-            # Log thought process
-            thought = result.get("thought_process", "No thought process provided.")
-            log.info(f"   [THOUGHT] {thought[:200]}...")
-
-            # Convert NEWPARA markers
-            if "body" in result:
-                result["body"] = result["body"].replace("NEWPARA", "\n\n").strip()
-
-            log.info(f"   [OK] Rewrite complete (Key #{key_idx}): \"{result.get('headline', '')[:60]}...\"")
-            return result
-
-        except Exception as e:
-            error_msg = str(e).lower()
+    
+    # Quick check: Are all Cerebras keys on cooldown?
+    now = time.time()
+    any_available = any(i not in key_manager.exhausted and now >= key_manager.cooldowns[i] for i in range(len(key_manager.keys)))
+    
+    if not any_available:
+        log.warning("   [AI] All Cerebras keys on cooldown/exhausted. Skipping to fallbacks.")
+        cerebras_failed = True
+    else:
+        for attempt in range(1, MAX_RETRIES + 1):
+            client, key_idx = key_manager.get_client()
             
-            # Handle rate limiting (429)
-            if "429" in error_msg or "rate limit" in error_msg:
-                log.warning(f"   [RATE-LIMIT] Key #{key_idx} hit limit. Switching...")
-                wait_time = 60
-                if "retry-after" in error_msg:
-                    try:
-                        parts = error_msg.split("retry-after")[-1].split()
-                        for p in parts:
-                            if p.isdigit():
-                                wait_time = int(p)
-                                break
-                    except: pass
+            try:
+                response = client.chat.completions.create(
+                    model=AI_MODEL,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.7,
+                    max_tokens=3000,
+                    response_format={"type": "json_object"},
+                )
+
+                raw_text = response.choices[0].message.content
+                if not raw_text:
+                    log.warning(f"   [WARN] Empty response (Key #{key_idx}, attempt {attempt})")
+                    continue
+
+                result = clean_and_parse_json(raw_text)
+                required = {"headline", "summary", "body"}
+                if not required.issubset(result.keys()):
+                    log.warning(f"   [WARN] Missing keys in response: {required - set(result.keys())}")
+                    continue
+
+                # Log thought process
+                thought = result.get("thought_process", "No thought process provided.")
+                log.info(f"   [THOUGHT] {thought[:200]}...")
+
+                # Convert NEWPARA markers
+                if "body" in result:
+                    result["body"] = result["body"].replace("NEWPARA", "\n\n").strip()
+
+                log.info(f"   [OK] Rewrite complete (Key #{key_idx}): \"{result.get('headline', '')[:60]}...\"")
+                return result
+
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "429" in error_msg or "rate limit" in error_msg:
+                    log.warning(f"   [RATE-LIMIT] Key #{key_idx} hit limit. Switching...")
+                    wait_time = 60
+                    if "retry-after" in error_msg:
+                        try:
+                            parts = error_msg.split("retry-after")[-1].split()
+                            for p in parts:
+                                if p.isdigit():
+                                    wait_time = int(p)
+                                    break
+                        except: pass
+                    
+                    key_manager.mark_cooldown(key_idx, wait_time)
+                    cerebras_failed = True
+                    if (openrouter and openrouter.is_available()) or (gemini and gemini.is_available()):
+                        log.info(f"   [FALLBACK] Backup available — skipping Cerebras cooldown wait.")
+                        break
+                    continue 
                 
-                key_manager.mark_cooldown(key_idx, wait_time)
+                # Handle exhaustion
+                if "daily limit" in error_msg:
+                    key_manager.mark_exhausted(key_idx)
+                    cerebras_failed = True
+
+                    # If OpenRouter or Gemini backup is available, skip waiting — fallback NOW
+                    if (openrouter and openrouter.is_available()) or (gemini and gemini.is_available()):
+                        log.info(f"   [FALLBACK] Backup available — skipping exhausted Cerebras keys.")
+                        break
+                    continue
+
+                log.error(f"   [ERROR] Cerebras error (Key #{key_idx}, attempt {attempt}): {e}")
                 cerebras_failed = True
+                if attempt < MAX_RETRIES:
+                    time.sleep(2 * attempt)
 
-                # If Gemini backup is available, skip waiting on cooldown keys — fallback NOW
-                if gemini and gemini.is_available():
-                    log.info(f"   [FALLBACK] Gemini available — skipping Cerebras cooldown wait.")
-                    break
-                continue 
-            
-            # Handle exhaustion
-            if "daily limit" in error_msg:
-                key_manager.mark_exhausted(key_idx)
-                cerebras_failed = True
-
-                # If Gemini backup is available, skip waiting — fallback NOW
-                if gemini and gemini.is_available():
-                    log.info(f"   [FALLBACK] Gemini available — skipping exhausted Cerebras keys.")
-                    break
-                continue
-
-            log.error(f"   [ERROR] Cerebras error (Key #{key_idx}, attempt {attempt}): {e}")
-            cerebras_failed = True
-            if attempt < MAX_RETRIES:
-                time.sleep(2 * attempt)
+    # ── OpenRouter Fallback ──
+    if cerebras_failed and openrouter and openrouter.is_available():
+        log.info(f"   [FALLBACK] All Cerebras keys failed. Switching to OpenRouter...")
+        res = openrouter.rewrite(title, content, category)
+        if res: return res
 
     # ── Gemini Fallback ──
     if cerebras_failed and gemini and gemini.is_available():
-        log.info(f"   [FALLBACK] All Cerebras keys failed. Switching to {GEMINI_REWRITE_MODEL}...")
+        log.info(f"   [FALLBACK] All previous options failed. Switching to {GEMINI_REWRITE_MODEL}...")
         return gemini.rewrite(title, content, category)
 
     return None
@@ -868,7 +1012,7 @@ def save_ignored_article_supabase(sb: Client, article: dict, rewritten: dict):
         sb.table("ignored_articles").upsert(data, on_conflict="original_url").execute()
         log.info(f"   [LOGGED] Recorded ignored article in DB")
     except Exception as e:
-        log.error(f"   [ERROR] Failed to save to ignored_articles: {e}")
+        log.error(f"[ERROR] Failed to save to ignored_articles: {e}")
 
 # ─── Data Cleanup ────────────────────────────────────────────────────────────
 
@@ -885,12 +1029,12 @@ def cleanup_old_data(sb: Client):
 
 # ─── Main Processing Loop ───────────────────────────────────────────────────
 
-def process_cycle(key_manager: 'AIKeyManager', sb: Client, tracker: URLTracker, gemini: Optional['GeminiBackup'] = None) -> tuple[int, bool]:
+def process_cycle(key_manager: 'AIKeyManager', sb: Client, tracker: URLTracker, openrouter: Optional['OpenRouterMiddle'] = None, gemini: Optional['GeminiBackup'] = None) -> tuple[int, bool]:
     """
     One full processing cycle:
     1. Fetch RSS feed and filter for new content
     2. Scrape full article body
-    3. Analyze and rewrite using Cerebras/Gemini AI (Reasoning Step)
+    3. Analyze and rewrite using Cerebras/OpenRouter/Gemini AI (Reasoning Step)
     4. Determine category (India vs International)
     5. Save to Supabase and track usage
     
@@ -939,8 +1083,8 @@ def process_cycle(key_manager: 'AIKeyManager', sb: Client, tracker: URLTracker, 
                 continue
             log.info("   [INFO] Using RSS description as fallback content")
 
-        # Step 2: Pre-filter with smaller model (Cerebras Llama → Gemini Flash fallback)
-        filter_result = pre_filter_article(key_manager, article["title"], content, gemini=gemini)
+        # Step 2: Pre-filter with smaller model (Cerebras Llama → OpenRouter Llama → Gemini Flash fallback)
+        filter_result = pre_filter_article(key_manager, article["title"], content, openrouter=openrouter, gemini=gemini)
         
         if filter_result:
             raw_is_news = filter_result.get("is_news", True)
@@ -959,9 +1103,9 @@ def process_cycle(key_manager: 'AIKeyManager', sb: Client, tracker: URLTracker, 
             
             article["category"] = filter_result.get("category", "india")
 
-        # Step 3: Rewrite with high-quality AI (Cerebras Qwen → Gemini Pro fallback)
+        # Step 3: Rewrite with high-quality AI (Cerebras Qwen → OpenRouter Qwen → Gemini Pro fallback)
         qwen_used = True 
-        rewritten = rewrite_article(key_manager, article["title"], content, article["category"], gemini=gemini)
+        rewritten = rewrite_article(key_manager, article["title"], content, article["category"], openrouter=openrouter, gemini=gemini)
         
         if not rewritten:
             log.warning("   [SKIP] Rewrite failed. Breaking cycle to protect Qwen rate limits.")
@@ -987,16 +1131,16 @@ def main():
     """Main entry point - runs the agent loop 24/7."""
 
     log.info("=" * 60)
-    log.info(">>> AirNews AI Agent (V9.0 - Cerebras + Gemini Failover) Starting")
+    log.info(">>> AirNews AI Agent (V10.1 - Cerebras + OpenRouter + Gemini Fallback) Starting")
     log.info("=" * 60)
     
     log.info(f"[CONFIG] Poll interval: {POLL_INTERVAL_SECONDS}s ({POLL_INTERVAL_SECONDS//60} min)")
     log.info(f"[CONFIG] Daily limit:   {DAILY_API_LIMIT} articles")
     log.info(f"[CONFIG] Per-cycle max: {MAX_ARTICLES_PER_CYCLE} articles")
-    log.info(f"[CONFIG] Backup:        Gemini Flash + Flash-Lite")
+    log.info(f"[CONFIG] Backup:        OpenRouter (Middle) + Gemini (Last)")
     log.info("")
 
-    key_manager, gemini = init_ai()
+    key_manager, openrouter, gemini = init_ai()
     sb = init_supabase()
     tracker = URLTracker(sb)
 
@@ -1014,7 +1158,7 @@ def main():
         log.info(f"{'---'*20}")
 
         try:
-            processed, qwen_used = process_cycle(key_manager, sb, tracker, gemini=gemini)
+            processed, qwen_used = process_cycle(key_manager, sb, tracker, openrouter=openrouter, gemini=gemini)
             log.info(f"[DONE] Cycle #{cycle_count}: {processed} articles processed")
         except Exception as e:
             log.error(f"[ERROR] Cycle #{cycle_count}: {e}")
