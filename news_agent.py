@@ -604,8 +604,9 @@ class OpenRouterMiddle:
         log.warning(f"[OPENROUTER] On cooldown for {seconds}s")
 
     def pre_filter(self, title: str, content: str) -> Optional[dict]:
-        # Pre-filter (Safe free router) - Only 1 retry for pre-filter to keep scan fast
-        for attempt in range(1, 2):
+        """Pre-filter article using OpenRouter with 5 retries."""
+        prompt = f"Title: {title}\n\nContent: {content[:2000]}"
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
                 response = self.client.chat.completions.create(
                     model=OPENROUTER_FILTER_MODEL,
@@ -628,7 +629,8 @@ class OpenRouterMiddle:
                 if "429" in error_msg or "rate limit" in error_msg:
                     self.mark_cooldown(60)
                     break 
-                log.warning(f"   [OPENROUTER-FILTER] Failed: {e}")
+                log.warning(f"   [OPENROUTER-FILTER] Attempt {attempt} failed: {e}")
+                if attempt < MAX_RETRIES: time.sleep(2 * attempt)
         return None
 
     def rewrite(self, title: str, content: str, category: str) -> Optional[dict]:
@@ -638,8 +640,8 @@ class OpenRouterMiddle:
         models_to_try = OPENROUTER_MODELS
         
         for model_id in models_to_try:
-            # 5 retries for Laguna, 1 for others
-            model_retries = MAX_RETRIES if "laguna" in model_id else 1
+            # 5 retries for openrouter/free, 2 for specific models
+            model_retries = MAX_RETRIES if model_id == "openrouter/free" else 2
             log.info(f"   [OPENROUTER] Attempting rewrite with {model_id} (max {model_retries} retries)...")
             for attempt in range(1, model_retries + 1):
                 try:
