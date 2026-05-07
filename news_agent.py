@@ -1,5 +1,5 @@
 """
-AirNews AI Agent (V10.1 - Cerebras + OpenRouter + Gemini Fallback)
+AirNews AI Agent (V10.3 - Cerebras + NVIDIA + Mistral + OpenRouter + Gemini Fallback)
 ========================================================
 Fetches RSS feeds from TOI, Times Now, NDTV, and The Hindu, scrapes full articles,
 pre-filters via Llama-8B, rewrites via Cerebras Qwen-235B, and saves to Supabase.
@@ -8,10 +8,10 @@ Key Features:
 - Reasoning-First Architecture: Forces Qwen to analyze situational context and projections.
 - Dual-Model Filtering: Uses Llama-3.1-8B for high-throughput scanning (30 RPM)
   and Qwen-2.5-235B for high-quality editorial rewriting (1 RPM).
-- Multi-Tier Fallback: Falls back to OpenRouter (free) and then Gemini 2.5 Pro (rewriting)
-  and Gemini 2.5 Flash (filtering) when Cerebras rate limits are exhausted.
+- Multi-Tier Fallback: Falls back to NVIDIA NIM (Llama 3.1), then Mistral (Large), 
+  then OpenRouter (Free), and finally Gemini when primary providers are limited.
 - Strict 'Hard News Only' Policy: Blocks speculative political commentary and features.
-- Strict Pacing: Automatically sleeps for 180s after every successful rewrite.
+- Strict Pacing: Automatically sleeps for 60s after every successful rewrite (1 RPM).
 - Self-Healing: Gracefully handles API exhaustion without crashing.
 """
 
@@ -492,22 +492,34 @@ AI_MODEL = "qwen-3-235b-a22b-instruct-2507"
 FILTER_MODEL = "llama3.1-8b"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
-# OpenRouter (Middle Fallback — between Cerebras and Gemini)
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_FILTER_MODEL = "openrouter/free"                       # Pre-filter (Safe free router)
+# NVIDIA NIM (Tier 2 Fallback — between Cerebras and Mistral)
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+NVIDIA_REWRITE_MODEL = "meta/llama-3.3-70b-instruct"
+NVIDIA_FILTER_MODEL = "meta/llama-4-maverick-17b-128e-instruct"
 
-# List of specific free models to try in order (V10.2 Model Chain)
+# Mistral AI (Tier 3 Fallback — between NVIDIA and OpenRouter)
+MISTRAL_BASE_URL = "https://api.mistral.ai/v1"
+MISTRAL_REWRITE_MODEL = "mistral-large-latest"
+MISTRAL_FILTER_MODEL = "mistral-small-latest"
+
+# OpenRouter (Tier 4 Fallback — between Mistral and Gemini)
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_FILTER_MODEL = "openrouter/free"
 OPENROUTER_MODELS = [
+    "openrouter/free",
     "inclusionai/ling-2.6-1t:free",
-    "nvidia/nemotron-nano-9b-v2:free",
-    "minimax/minimax-m2.5:free",
-    "poolside/laguna-m.1:free",
-    "openrouter/free"
+    "google/gemma-4-26b-a4b-it:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "openai/gpt-oss-120b:free",
+    "openai/gpt-oss-20b:free",
+    "liquid/lfm-2.5-1.2b-instruct:free",
+    "baidu/qianfan-ocr-fast:free",
+    "openrouter/owl-alpha",
 ]
 
-# Gemini (Backup — activated when ALL Cerebras and OpenRouter keys are exhausted)
-GEMINI_REWRITE_MODEL = "gemini-flash-latest"       # Capable enough for rewriting, huge free quota
-GEMINI_FILTER_MODEL = "gemini-flash-lite-latest"   # Lightning fast for true/false pre-filter
+# Gemini (Tier 5 Backup — activated when ALL other providers fail)
+GEMINI_REWRITE_MODEL = "gemini-flash-latest"
+GEMINI_FILTER_MODEL = "gemini-flash-lite-latest"
 
 PRE_FILTER_PROMPT = """Analyze this article and determine if it is a factual news event or a high-quality analytical report.
 
@@ -534,16 +546,24 @@ Return ONLY a JSON object:
 
 
 class AIKeyManager:
-    """Manages a pool of Cerebras API keys with intelligent rotation."""
+    """Manages a pool of API keys with intelligent rotation across different providers."""
     
-    def __init__(self, keys: list[str]):
+    def __init__(self, provider_name: str, keys: list[str], base_url: Optional[str] = None):
+        self.provider_name = provider_name
         self.keys = keys
-        self.clients = [OpenAI(api_key=k, base_url=CEREBRAS_BASE_URL) for k in keys]
+        self.base_url = base_url
+        self.clients = []
+        
+        if provider_name.lower() == "gemini":
+            self.clients = [genai.Client(api_key=k) for k in keys]
+        else:
+            self.clients = [OpenAI(api_key=k, base_url=base_url) for k in keys]
+            
         self.current_index = 0
         self.cooldowns = {i: 0 for i in range(len(keys))}
         self.exhausted = set()
 
-    def get_client(self) -> tuple[OpenAI, int]:
+    def get_client(self) -> tuple[any, int]:
         """Returns the next available client and its index."""
         now = time.time()
         
@@ -557,7 +577,7 @@ class AIKeyManager:
         # Self-Healing Check: If all keys are exhausted, sleep instead of crashing
         active_keys = [i for i in range(len(self.keys)) if i not in self.exhausted]
         if not active_keys:
-            log.error("[KEY-MANAGER] ALL KEYS EXHAUSTED. Sleeping for 1 hour before retrying...")
+            log.error(f"[{self.provider_name}-MANAGER] ALL KEYS EXHAUSTED. Sleeping for 1 hour before retrying...")
             time.sleep(3600)
             self.exhausted.clear() # Clear memory to give them a fresh attempt
             return self.clients[0], 0
@@ -565,7 +585,7 @@ class AIKeyManager:
         best_idx = min(active_keys, key=lambda i: self.cooldowns[i])
         wait_time = max(0, self.cooldowns[best_idx] - now)
         if wait_time > 0:
-            log.info(f"[KEY-MANAGER] All keys on cooldown. Waiting {int(wait_time)}s for Key #{best_idx}...")
+            log.info(f"[{self.provider_name}-MANAGER] All keys on cooldown. Waiting {int(wait_time)}s for Key #{best_idx}...")
             time.sleep(wait_time)
         
         return self.clients[best_idx], best_idx
@@ -573,79 +593,85 @@ class AIKeyManager:
     def mark_cooldown(self, index: int, seconds: int = 60):
         """Put a key on cooldown (e.g., after a 429 error)."""
         self.cooldowns[index] = time.time() + seconds
-        log.warning(f"[KEY-MANAGER] Key #{index} put on cooldown for {seconds}s")
+        log.warning(f"[{self.provider_name}-MANAGER] Key #{index} put on cooldown for {seconds}s")
         self.current_index = (self.current_index + 1) % len(self.keys)
 
     def mark_exhausted(self, index: int):
         """Mark a key as exhausted for the day."""
         self.exhausted.add(index)
-        log.error(f"[KEY-MANAGER] Key #{index} EXHAUSTED for the day.")
+        log.error(f"[{self.provider_name}-MANAGER] Key #{index} EXHAUSTED for the day.")
 
 # ─── Middle-Tier & Gemini Backup Providers ───────────────────────────────────
 
 class OpenRouterMiddle:
     """OpenRouter middle-tier fallback — sits between Cerebras and Gemini."""
 
-    def __init__(self, api_key: str):
-        self.client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
+    def __init__(self, keys: list[str]):
+        self.manager = AIKeyManager("OPENROUTER", keys, base_url=OPENROUTER_BASE_URL)
         self.available = True
-        self.cooldown_until = 0
-        log.info(f"[OPENROUTER] Middle fallback initialized with {len(OPENROUTER_MODELS)} models (filter={OPENROUTER_FILTER_MODEL})")
+        log.info(f"[OPENROUTER] Middle fallback initialized with {len(keys)} keys and {len(OPENROUTER_MODELS)} models.")
 
     def is_available(self) -> bool:
-        """Check if OpenRouter is available (not on cooldown)."""
-        if not self.available:
-            return False
-        return time.time() >= self.cooldown_until
-
-    def mark_cooldown(self, seconds: int = 60):
-        """Put OpenRouter on cooldown after a rate-limit hit."""
-        self.cooldown_until = time.time() + seconds
-        log.warning(f"[OPENROUTER] On cooldown for {seconds}s")
+        """Check if OpenRouter is available (not all keys exhausted)."""
+        return len(self.manager.exhausted) < len(self.manager.keys)
 
     def pre_filter(self, title: str, content: str) -> Optional[dict]:
-        """Pre-filter article using OpenRouter with 5 retries."""
+        """Pre-filter article using OpenRouter with multi-model fallback."""
         prompt = f"Title: {title}\n\nContent: {content[:2000]}"
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                response = self.client.chat.completions.create(
-                    model=OPENROUTER_FILTER_MODEL,
-                    messages=[
-                        {"role": "system", "content": PRE_FILTER_PROMPT},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.1,
-                    response_format={"type": "json_object"},
-                )
-                raw_text = response.choices[0].message.content
-                if not raw_text:
-                    log.warning(f"   [OPENROUTER-FILTER] Empty response")
-                    continue
-                result = clean_and_parse_json(raw_text)
-                log.info(f"   [FILTER] model={OPENROUTER_FILTER_MODEL} (middle) is_news={result.get('is_news')} cat={result.get('category')} reason={result.get('reason')}")
-                return result
-            except Exception as e:
-                error_msg = str(e).lower()
-                if "429" in error_msg or "rate limit" in error_msg:
-                    self.mark_cooldown(60)
-                    break 
-                log.warning(f"   [OPENROUTER-FILTER] Attempt {attempt} failed: {e}")
-                if attempt < MAX_RETRIES: time.sleep(2)
+        
+        # Try a subset of reliable models for filtering
+        models_to_try = [OPENROUTER_FILTER_MODEL] + OPENROUTER_MODELS[:5]
+        
+        for model_id in models_to_try:
+            log.info(f"   [OPENROUTER-FILTER] Attempting with {model_id}...")
+            for attempt in range(1, 3): # 2 attempts per model for filtering
+                client, key_idx = self.manager.get_client()
+                try:
+                    response = client.chat.completions.create(
+                        model=model_id,
+                        messages=[
+                            {"role": "system", "content": PRE_FILTER_PROMPT},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.1,
+                        response_format={"type": "json_object"},
+                    )
+                    raw_text = response.choices[0].message.content
+                    if not raw_text:
+                        log.warning(f"   [OPENROUTER-FILTER] Empty response from {model_id}")
+                        continue
+                    
+                    result = clean_and_parse_json(raw_text)
+                    log.info(f"   [FILTER] model={model_id} (middle) is_news={result.get('is_news')} cat={result.get('category')}")
+                    return result
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "429" in error_msg or "rate limit" in error_msg:
+                        log.warning(f"   [OPENROUTER-FILTER] Key #{key_idx} rate limited for {model_id}.")
+                        self.manager.mark_cooldown(key_idx, 60)
+                        break # Try next model
+                    log.warning(f"   [OPENROUTER-FILTER] Key #{key_idx} attempt {attempt} failed: {e}")
+                    if attempt < 2: time.sleep(1)
         return None
 
     def rewrite(self, title: str, content: str, category: str) -> Optional[dict]:
-        """Rewrite article using OpenRouter with retries per model."""
+        """Rewrite article using OpenRouter with retries per model and reasoning support."""
         prompt = AI_REWRITE_PROMPT.format(title=title, content=content, category=category)
         
-        models_to_try = OPENROUTER_MODELS
-        
-        for model_id in models_to_try:
-            # 5 retries for openrouter/free, 2 for specific models
+        for model_id in OPENROUTER_MODELS:
+            # More retries for the main router, fewer for specific models
             model_retries = MAX_RETRIES if model_id == "openrouter/free" else 2
-            log.info(f"   [OPENROUTER] Attempting rewrite with {model_id} (max {model_retries} retries)...")
+            log.info(f"   [OPENROUTER] Attempting rewrite with {model_id}...")
+            
             for attempt in range(1, model_retries + 1):
+                client, key_idx = self.manager.get_client()
                 try:
-                    response = self.client.chat.completions.create(
+                    # Prepare extra body for reasoning if using openrouter/free
+                    extra_body = {}
+                    if model_id == "openrouter/free":
+                        extra_body = {"reasoning": {"enabled": True}}
+
+                    response = client.chat.completions.create(
                         model=model_id,
                         messages=[
                             {"role": "system", "content": SYSTEM_PROMPT},
@@ -654,133 +680,311 @@ class OpenRouterMiddle:
                         temperature=0.7,
                         max_tokens=3000,
                         response_format={"type": "json_object"},
+                        extra_body=extra_body if extra_body else None
                     )
-                    raw_text = response.choices[0].message.content
+                    
+                    msg = response.choices[0].message
+                    raw_text = msg.content
+                    
                     if not raw_text:
-                        log.warning(f"   [OPENROUTER-REWRITE] Empty response from {model_id} (attempt {attempt})")
+                        log.warning(f"   [OPENROUTER-REWRITE] Empty response from {model_id} (Key #{key_idx}, attempt {attempt})")
                         continue
 
                     result = clean_and_parse_json(raw_text)
                     required = {"headline", "summary", "body"}
                     if not required.issubset(result.keys()):
-                        log.warning(f"   [OPENROUTER-REWRITE] Missing keys from {model_id} (attempt {attempt})")
+                        log.warning(f"   [OPENROUTER-REWRITE] Missing keys from {model_id} (Key #{key_idx}, attempt {attempt})")
                         continue
 
-                    # Log thought process
+                    # Extract thought process or reasoning details
+                    reasoning = getattr(msg, 'reasoning_details', None)
+                    if reasoning:
+                        # If we have native reasoning, use it to enrich thought process
+                        result["thought_process"] = f"[REASONING] {reasoning}\n\n[THOUGHT] {result.get('thought_process', '')}"
+                    
                     thought = result.get("thought_process", "No thought process provided.")
-                    log.info(f"   [THOUGHT] {thought[:200]}...")
+                    log.info(f"   [THOUGHT] {str(thought)[:200]}...")
 
                     # Convert NEWPARA markers
                     if "body" in result:
                         result["body"] = result["body"].replace("NEWPARA", "\n\n").strip()
 
-                    log.info(f"   [OK] OpenRouter rewrite complete ({model_id}): \"{result.get('headline', '')[:60]}...\"")
+                    log.info(f"   [OK] OpenRouter rewrite complete ({model_id}) via Key #{key_idx}: \"{result.get('headline', '')[:60]}...\"")
                     return result
 
                 except Exception as e:
                     error_msg = str(e).lower()
                     if "429" in error_msg or "rate limit" in error_msg:
-                        self.mark_cooldown(60)
-                        break # Skip to next model if rate limited
-                    log.warning(f"   [OPENROUTER-REWRITE] Attempt {attempt} with {model_id} failed: {e}")
+                        log.warning(f"   [OPENROUTER-REWRITE] Key #{key_idx} rate limited for {model_id}. Moving to next key...")
+                        self.manager.mark_cooldown(key_idx, 60)
+                        continue # Try next key for same model
+                    log.warning(f"   [OPENROUTER-REWRITE] Key #{key_idx} attempt {attempt} with {model_id} failed: {e}")
                     if attempt < model_retries: time.sleep(2)
+        return None
+
+class NvidiaFallback:
+    """NVIDIA NIM fallback — sits between Cerebras and Mistral."""
+
+    def __init__(self, keys: list[str]):
+        self.manager = AIKeyManager("NVIDIA", keys, base_url=NVIDIA_BASE_URL)
+        self.available = True
+        log.info(f"[NVIDIA] Fallback initialized with {len(keys)} keys.")
+
+    def is_available(self) -> bool:
+        """Check if NVIDIA is available (not all keys exhausted)."""
+        return len(self.manager.exhausted) < len(self.manager.keys)
+
+    def pre_filter(self, title: str, content: str) -> Optional[dict]:
+        """Pre-filter article using Llama 3.1 8B on NVIDIA NIM."""
+        prompt = f"Title: {title}\n\nContent: {content[:2000]}"
+        for attempt in range(1, 3):
+            client, key_idx = self.manager.get_client()
+            try:
+                response = client.chat.completions.create(
+                    model=NVIDIA_FILTER_MODEL,
+                    messages=[
+                        {"role": "system", "content": PRE_FILTER_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.1,
+                    # response_format={"type": "json_object"} is technically supported but NIM prefers schema
+                    # For consistency with current architecture, we use it and verify the result.
+                    response_format={"type": "json_object"},
+                )
+                raw_text = response.choices[0].message.content
+                result = clean_and_parse_json(raw_text)
+                log.info(f"   [FILTER] model={NVIDIA_FILTER_MODEL} (nvidia) is_news={result.get('is_news')} cat={result.get('category')}")
+                return result
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "429" in error_msg or "rate" in error_msg:
+                    log.warning(f"   [NVIDIA-FILTER] Key #{key_idx} rate limited.")
+                    self.manager.mark_cooldown(key_idx, 60)
+                    continue
+                log.warning(f"   [NVIDIA-FILTER] Key #{key_idx} failed: {e}")
+                if attempt < 2: time.sleep(1)
+        return None
+
+    def rewrite(self, title: str, content: str, category: str) -> Optional[dict]:
+        """Rewrite article using Llama 3.1 Nemotron 70B on NVIDIA NIM."""
+        prompt = AI_REWRITE_PROMPT.format(title=title, content=content, category=category)
+        for attempt in range(1, 3):
+            client, key_idx = self.manager.get_client()
+            try:
+                response = client.chat.completions.create(
+                    model=NVIDIA_REWRITE_MODEL,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.7,
+                    max_tokens=3000,
+                    response_format={"type": "json_object"},
+                )
+                raw_text = response.choices[0].message.content
+                if not raw_text:
+                    continue
+
+                result = clean_and_parse_json(raw_text)
+                required = {"headline", "summary", "body"}
+                if not required.issubset(result.keys()):
+                    continue
+
+                # Convert NEWPARA markers
+                if "body" in result:
+                    result["body"] = result["body"].replace("NEWPARA", "\n\n").strip()
+
+                log.info(f"   [OK] NVIDIA rewrite complete ({NVIDIA_REWRITE_MODEL}) via Key #{key_idx}")
+                return result
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "429" in error_msg or "rate" in error_msg:
+                    log.warning(f"   [NVIDIA-REWRITE] Key #{key_idx} rate limited.")
+                    self.manager.mark_cooldown(key_idx, 60)
+                    continue
+                log.error(f"   [NVIDIA-REWRITE] Key #{key_idx} failed: {e}")
+                if attempt < 2: time.sleep(2)
+        return None
+
+class MistralFallback:
+    """Mistral AI fallback — sits between Cerebras and OpenRouter."""
+
+    def __init__(self, keys: list[str]):
+        self.manager = AIKeyManager("MISTRAL", keys, base_url=MISTRAL_BASE_URL)
+        self.available = True
+        log.info(f"[MISTRAL] Fallback initialized with {len(keys)} keys.")
+
+    def is_available(self) -> bool:
+        """Check if Mistral is available (not all keys exhausted)."""
+        return len(self.manager.exhausted) < len(self.manager.keys)
+
+    def pre_filter(self, title: str, content: str) -> Optional[dict]:
+        """Pre-filter article using Mistral Small."""
+        prompt = f"Title: {title}\n\nContent: {content[:2000]}"
+        for attempt in range(1, 3):
+            client, key_idx = self.manager.get_client()
+            try:
+                response = client.chat.completions.create(
+                    model=MISTRAL_FILTER_MODEL,
+                    messages=[
+                        {"role": "system", "content": PRE_FILTER_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                )
+                raw_text = response.choices[0].message.content
+                result = clean_and_parse_json(raw_text)
+                log.info(f"   [FILTER] model={MISTRAL_FILTER_MODEL} (mistral) is_news={result.get('is_news')} cat={result.get('category')}")
+                return result
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "429" in error_msg or "rate" in error_msg:
+                    log.warning(f"   [MISTRAL-FILTER] Key #{key_idx} rate limited.")
+                    self.manager.mark_cooldown(key_idx, 60)
+                    continue
+                log.warning(f"   [MISTRAL-FILTER] Key #{key_idx} failed: {e}")
+                if attempt < 2: time.sleep(1)
+        return None
+
+    def rewrite(self, title: str, content: str, category: str) -> Optional[dict]:
+        """Rewrite article using Mistral Large."""
+        prompt = AI_REWRITE_PROMPT.format(title=title, content=content, category=category)
+        for attempt in range(1, 3):
+            client, key_idx = self.manager.get_client()
+            try:
+                response = client.chat.completions.create(
+                    model=MISTRAL_REWRITE_MODEL,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.7,
+                    max_tokens=3000,
+                    response_format={"type": "json_object"},
+                )
+                raw_text = response.choices[0].message.content
+                if not raw_text:
+                    continue
+
+                result = clean_and_parse_json(raw_text)
+                required = {"headline", "summary", "body"}
+                if not required.issubset(result.keys()):
+                    continue
+
+                # Convert NEWPARA markers
+                if "body" in result:
+                    result["body"] = result["body"].replace("NEWPARA", "\n\n").strip()
+
+                log.info(f"   [OK] Mistral rewrite complete ({MISTRAL_REWRITE_MODEL}) via Key #{key_idx}")
+                return result
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "429" in error_msg or "rate" in error_msg:
+                    log.warning(f"   [MISTRAL-REWRITE] Key #{key_idx} rate limited.")
+                    self.manager.mark_cooldown(key_idx, 60)
+                    continue
+                log.error(f"   [MISTRAL-REWRITE] Key #{key_idx} failed: {e}")
+                if attempt < 2: time.sleep(2)
         return None
 
 class GeminiBackup:
     """Google Gemini backup provider — activated when Cerebras and OpenRouter are rate-limited."""
 
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.client = genai.Client(api_key=api_key)
+    def __init__(self, keys: list[str]):
+        self.manager = AIKeyManager("GEMINI", keys)
         self.available = True
-        self.cooldown_until = 0
-        log.info(f"[GEMINI] Backup provider initialized (rewrite={GEMINI_REWRITE_MODEL}, filter={GEMINI_FILTER_MODEL})")
+        log.info(f"[GEMINI] Backup provider initialized with {len(keys)} keys (rewrite={GEMINI_REWRITE_MODEL}, filter={GEMINI_FILTER_MODEL})")
 
     def is_available(self) -> bool:
-        """Check if Gemini is available (not on cooldown)."""
-        if not self.available:
-            return False
-        if time.time() < self.cooldown_until:
-            return False
-        return True
-
-    def mark_cooldown(self, seconds: int = 60):
-        """Put Gemini on cooldown after a rate-limit hit."""
-        self.cooldown_until = time.time() + seconds
-        log.warning(f"[GEMINI] On cooldown for {seconds}s")
+        """Check if Gemini is available (not all keys exhausted)."""
+        return len(self.manager.exhausted) < len(self.manager.keys)
 
     def pre_filter(self, title: str, content: str) -> Optional[dict]:
-        """Pre-filter article using Gemini 2.5 Flash."""
+        """Pre-filter article using Gemini 2.5 Flash with retries for 503."""
         prompt = f"{PRE_FILTER_PROMPT}\n\nTitle: {title}\n\nContent: {content[:2000]}"
-        try:
-            response = self.client.models.generate_content(
-                model=GEMINI_FILTER_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,
-                ),
-            )
-            raw_text = response.text
-            if not raw_text:
-                log.warning("   [GEMINI-FILTER] Empty response")
-                return None
-            result = clean_and_parse_json(raw_text)
-            log.info(f"   [FILTER] model={GEMINI_FILTER_MODEL} (backup) is_news={result.get('is_news')} cat={result.get('category')} reason={result.get('reason')}")
-            return result
-        except Exception as e:
-            error_msg = str(e).lower()
-            if "429" in error_msg or "resource_exhausted" in error_msg or "rate" in error_msg:
-                self.mark_cooldown(60)
-            log.warning(f"   [GEMINI-FILTER] Backup filter failed: {e}")
-            return None
+        for attempt in range(1, 4): # 3 retries for Gemini
+            client, key_idx = self.manager.get_client()
+            try:
+                response = client.models.generate_content(
+                    model=GEMINI_FILTER_MODEL,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.1,
+                    ),
+                )
+                raw_text = response.text
+                if not raw_text:
+                    log.warning(f"   [GEMINI-FILTER] Key #{key_idx} empty response (attempt {attempt})")
+                    continue
+                result = clean_and_parse_json(raw_text)
+                log.info(f"   [FILTER] model={GEMINI_FILTER_MODEL} via Key #{key_idx} (backup) is_news={result.get('is_news')} cat={result.get('category')}")
+                return result
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "503" in error_msg or "unavailable" in error_msg:
+                    log.warning(f"   [GEMINI-FILTER] Key #{key_idx} service unavailable (503), retrying in {attempt*2}s...")
+                    time.sleep(attempt * 2)
+                    continue
+                if "429" in error_msg or "resource_exhausted" in error_msg or "rate" in error_msg:
+                    log.warning(f"   [GEMINI-FILTER] Key #{key_idx} rate limited.")
+                    self.manager.mark_cooldown(key_idx, 60)
+                    continue 
+                log.warning(f"   [GEMINI-FILTER] Key #{key_idx} backup filter failed: {e}")
+                break
+        return None
 
     def rewrite(self, title: str, content: str, category: str) -> Optional[dict]:
-        """Rewrite article using Gemini 2.5 Pro."""
+        """Rewrite article using Gemini 2.5 Pro with retries for 503."""
         prompt = f"{SYSTEM_PROMPT}\n\n{AI_REWRITE_PROMPT.format(title=title, content=content, category=category)}"
-        try:
-            response = self.client.models.generate_content(
-                model=GEMINI_REWRITE_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.7,
-                    max_output_tokens=3000,
-                ),
-            )
-            raw_text = response.text
-            if not raw_text:
-                log.warning("   [GEMINI-REWRITE] Empty response")
-                return None
+        for attempt in range(1, 4):
+            client, key_idx = self.manager.get_client()
+            try:
+                response = client.models.generate_content(
+                    model=GEMINI_REWRITE_MODEL,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.7,
+                        max_output_tokens=3000,
+                    ),
+                )
+                raw_text = response.text
+                if not raw_text:
+                    log.warning(f"   [GEMINI-REWRITE] Key #{key_idx} empty response (attempt {attempt})")
+                    continue
 
-            result = clean_and_parse_json(raw_text)
+                result = clean_and_parse_json(raw_text)
+                required = {"headline", "summary", "body"}
+                if not required.issubset(result.keys()):
+                    log.warning(f"   [GEMINI-REWRITE] Key #{key_idx} missing keys: {required - set(result.keys())}")
+                    continue
 
-            # Validate required keys
-            required = {"headline", "summary", "body"}
-            if not required.issubset(result.keys()):
-                log.warning(f"   [GEMINI-REWRITE] Missing keys: {required - set(result.keys())}")
-                return None
+                # Convert NEWPARA markers
+                if "body" in result:
+                    result["body"] = result["body"].replace("NEWPARA", "\n\n").strip()
+                
+                log.info(f"   [OK] Gemini rewrite complete ({GEMINI_REWRITE_MODEL}) via Key #{key_idx}")
+                return result
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "503" in error_msg or "unavailable" in error_msg:
+                    log.warning(f"   [GEMINI-REWRITE] Key #{key_idx} service unavailable (503), retrying in {attempt*2}s...")
+                    time.sleep(attempt * 2)
+                    continue
+                if "429" in error_msg or "resource_exhausted" in error_msg or "rate" in error_msg:
+                    log.warning(f"   [GEMINI-REWRITE] Key #{key_idx} rate limited.")
+                    self.manager.mark_cooldown(key_idx, 60)
+                    continue
+                log.error(f"   [GEMINI-REWRITE] Key #{key_idx} failed: {e}")
+                break
+        return None
 
-            # Log thought process
-            thought = result.get("thought_process", "No thought process provided.")
-            log.info(f"   [THOUGHT] {thought[:200]}...")
-
-            # Convert NEWPARA markers
-            if "body" in result:
-                result["body"] = result["body"].replace("NEWPARA", "\n\n").strip()
-            
-            return result
-        except Exception as e:
-            error_msg = str(e).lower()
-            if "429" in error_msg or "resource_exhausted" in error_msg or "rate" in error_msg:
-                self.mark_cooldown(60)
-            log.error(f"   [GEMINI-REWRITE] Failed: {e}")
-            return None
-
-def pre_filter_article(key_manager: 'AIKeyManager', title: str, content: str, openrouter: Optional['OpenRouterMiddle'] = None, gemini: Optional['GeminiBackup'] = None) -> Optional[dict]:
+def pre_filter_article(key_manager: 'AIKeyManager', title: str, content: str, nvidia: Optional['NvidiaFallback'] = None, mistral: Optional['MistralFallback'] = None, openrouter: Optional['OpenRouterMiddle'] = None, gemini: Optional['GeminiBackup'] = None) -> Optional[dict]:
     """
     Perform quick pre-filtering using a smaller model to save Qwen usage.
-    Falls back to OpenRouter then Gemini 2.5 Flash if Cerebras fails.
+    Falls back to NVIDIA, then Mistral, then OpenRouter, then Gemini 2.5 Flash if Cerebras fails.
     """
     prompt = f"Title: {title}\n\nContent: {content[:2000]}"
     
@@ -794,27 +998,47 @@ def pre_filter_article(key_manager: 'AIKeyManager', title: str, content: str, op
         log.warning("   [AI] All Cerebras keys on cooldown/exhausted. Skipping to fallbacks for pre-filter.")
         cerebras_failed = True
     else:
-        client, key_idx = key_manager.get_client()
-        try:
-            response = client.chat.completions.create(
-                model=FILTER_MODEL,
-                messages=[
-                    {"role": "system", "content": PRE_FILTER_PROMPT},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1,
-                response_format={"type": "json_object"},
-            )
-            raw_text = response.choices[0].message.content
-            result = clean_and_parse_json(raw_text)
-            log.info(f"   [FILTER] model={FILTER_MODEL} is_news={result.get('is_news')} cat={result.get('category')} reason={result.get('reason')}")
-            return result
-        except Exception as e:
-            error_msg = str(e).lower()
-            if "429" in error_msg or "rate limit" in error_msg:
-                key_manager.mark_cooldown(key_idx, 60)
-            log.warning(f"   [WARN] Cerebras pre-filter failed ({e}).")
-            cerebras_failed = True
+        # Try available Cerebras keys
+        for attempt in range(len(key_manager.keys)):
+            client, key_idx = key_manager.get_client()
+            try:
+                response = client.chat.completions.create(
+                    model=FILTER_MODEL,
+                    messages=[
+                        {"role": "system", "content": PRE_FILTER_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                )
+                raw_text = response.choices[0].message.content
+                result = clean_and_parse_json(raw_text)
+                log.info(f"   [FILTER] model={FILTER_MODEL} via Key #{key_idx} is_news={result.get('is_news')} cat={result.get('category')} reason={result.get('reason')}")
+                return result
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "429" in error_msg or "rate limit" in error_msg:
+                    key_manager.mark_cooldown(key_idx, 60)
+                    if attempt < len(key_manager.keys) - 1:
+                        log.info(f"   [RATE-LIMIT] Key #{key_idx} limited. Retrying with next Cerebras key...")
+                        continue
+                log.warning(f"   [WARN] Cerebras pre-filter failed for Key #{key_idx}: {e}")
+                cerebras_failed = True
+                break
+
+    # ── NVIDIA Fallback ──
+    if cerebras_failed and nvidia and nvidia.is_available():
+        log.info(f"   [FALLBACK] Switching to NVIDIA for pre-filter...")
+        res = nvidia.pre_filter(title, content)
+        if res: return res
+        log.warning("   [NVIDIA] NVIDIA filter returned no result. Trying Mistral...")
+
+    # ── Mistral Fallback ──
+    if cerebras_failed and mistral and mistral.is_available():
+        log.info(f"   [FALLBACK] Switching to Mistral for pre-filter...")
+        res = mistral.pre_filter(title, content)
+        if res: return res
+        log.warning("   [MISTRAL] Mistral filter returned no result. Trying OpenRouter...")
 
     # ── OpenRouter Fallback ──
     if cerebras_failed and openrouter and openrouter.is_available():
@@ -832,48 +1056,73 @@ def pre_filter_article(key_manager: 'AIKeyManager', title: str, content: str, op
     log.warning("   [WARN] No backup available. Proceeding to rewrite for safety.")
     return None
 
-def init_ai() -> tuple['AIKeyManager', Optional['OpenRouterMiddle'], Optional['GeminiBackup']]:
-    """Initialize Cerebras Key Manager, OpenRouter, and Gemini Backup from .env."""
+def init_ai() -> tuple['AIKeyManager', Optional['NvidiaFallback'], Optional['MistralFallback'], Optional['OpenRouterMiddle'], Optional['GeminiBackup']]:
+    """Initialize Cerebras, NVIDIA, Mistral, OpenRouter, and Gemini managers with multiple API keys."""
     load_dotenv(BASE_DIR / ".env", override=True)
-    keys_str = os.getenv("CEREBRAS_API_KEYS", "")
     
-    keys = [k.strip() for k in keys_str.split(",") if k.strip()]
-    
-    if not keys:
+    # Cerebras
+    c_keys_str = os.getenv("CEREBRAS_API_KEYS", "")
+    c_keys = [k.strip() for k in c_keys_str.split(",") if k.strip()]
+    if not c_keys:
         log.error("[FATAL] No CEREBRAS_API_KEYS defined in .env!")
         sys.exit(1)
-        
-    manager = AIKeyManager(keys)
-    log.info(f"[AI] Cerebras initialized with {len(keys)} keys. Primary model: {AI_MODEL}")
+    cerebras_manager = AIKeyManager("CEREBRAS", c_keys, base_url=CEREBRAS_BASE_URL)
+    log.info(f"[AI] Cerebras initialized with {len(c_keys)} keys. Primary model: {AI_MODEL}")
 
-    # Initialize OpenRouter middle fallback
-    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    openrouter = None
-    if openrouter_key:
+    # NVIDIA
+    nv_keys_str = os.getenv("Nvidia_AI_Key", "")
+    nv_keys = [k.strip() for k in nv_keys_str.split(",") if k.strip()]
+    nvidia = None
+    if nv_keys:
         try:
-            openrouter = OpenRouterMiddle(openrouter_key)
+            nvidia = NvidiaFallback(nv_keys)
+        except Exception as e:
+            log.warning(f"[WARN] NVIDIA fallback init failed: {e}")
+    else:
+        log.warning("[WARN] No Nvidia_AI_Key in .env. Running without NVIDIA fallback.")
+
+    # Mistral
+    m_keys_str = os.getenv("Mistral_Key", "") # Key from user .env
+    m_keys = [k.strip() for k in m_keys_str.split(",") if k.strip()]
+    mistral = None
+    if m_keys:
+        try:
+            mistral = MistralFallback(m_keys)
+        except Exception as e:
+            log.warning(f"[WARN] Mistral fallback init failed: {e}")
+    else:
+        log.warning("[WARN] No Mistral_Key in .env. Running without Mistral fallback.")
+
+    # OpenRouter
+    or_keys_str = os.getenv("OPENROUTER_API_KEYS", "")
+    or_keys = [k.strip() for k in or_keys_str.split(",") if k.strip()]
+    openrouter = None
+    if or_keys:
+        try:
+            openrouter = OpenRouterMiddle(or_keys)
         except Exception as e:
             log.warning(f"[WARN] OpenRouter middle fallback init failed: {e}")
     else:
-        log.warning("[WARN] No OPENROUTER_API_KEY in .env. Running without OpenRouter middle fallback.")
+        log.warning("[WARN] No OPENROUTER_API_KEYS in .env. Running without OpenRouter middle fallback.")
 
-    # Initialize Gemini backup
-    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    # Gemini
+    g_keys_str = os.getenv("GEMINI_API_KEYS", "")
+    g_keys = [k.strip() for k in g_keys_str.split(",") if k.strip()]
     gemini = None
-    if gemini_key:
+    if g_keys:
         try:
-            gemini = GeminiBackup(gemini_key)
+            gemini = GeminiBackup(g_keys)
         except Exception as e:
             log.warning(f"[WARN] Gemini backup init failed: {e}. Continuing without backup.")
     else:
-        log.warning("[WARN] No GEMINI_API_KEY in .env. Running without Gemini backup.")
+        log.warning("[WARN] No GEMINI_API_KEYS in .env. Running without Gemini backup.")
 
-    return manager, openrouter, gemini
+    return cerebras_manager, nvidia, mistral, openrouter, gemini
 
-def rewrite_article(key_manager: 'AIKeyManager', title: str, content: str, category: str, openrouter: Optional['OpenRouterMiddle'] = None, gemini: Optional['GeminiBackup'] = None) -> Optional[dict]:
+def rewrite_article(key_manager: 'AIKeyManager', title: str, content: str, category: str, nvidia: Optional['NvidiaFallback'] = None, mistral: Optional['MistralFallback'] = None, openrouter: Optional['OpenRouterMiddle'] = None, gemini: Optional['GeminiBackup'] = None) -> Optional[dict]:
     """
     Send article to Cerebras for analysis and rewriting.
-    Falls back to OpenRouter Qwen-235B/Free, then Gemini 2.5 Pro if all fail.
+    Falls back to NVIDIA, then Mistral, then OpenRouter Qwen-235B/Free, then Gemini 2.5 Pro if all fail.
     """
     prompt = AI_REWRITE_PROMPT.format(title=title, content=content, category=category)
 
@@ -887,7 +1136,9 @@ def rewrite_article(key_manager: 'AIKeyManager', title: str, content: str, categ
         log.warning("   [AI] All Cerebras keys on cooldown/exhausted. Skipping to fallbacks.")
         cerebras_failed = True
     else:
-        for attempt in range(1, MAX_RETRIES + 1):
+        # Try all available keys if needed
+        max_attempts = max(MAX_RETRIES, len(key_manager.keys))
+        for attempt in range(1, max_attempts + 1):
             client, key_idx = key_manager.get_client()
             
             try:
@@ -940,7 +1191,7 @@ def rewrite_article(key_manager: 'AIKeyManager', title: str, content: str, categ
                     
                     key_manager.mark_cooldown(key_idx, wait_time)
                     cerebras_failed = True
-                    if (openrouter and openrouter.is_available()) or (gemini and gemini.is_available()):
+                    if (nvidia and nvidia.is_available()) or (mistral and mistral.is_available()) or (openrouter and openrouter.is_available()) or (gemini and gemini.is_available()):
                         log.info(f"   [FALLBACK] Backup available — skipping Cerebras cooldown wait.")
                         break
                     continue 
@@ -950,8 +1201,8 @@ def rewrite_article(key_manager: 'AIKeyManager', title: str, content: str, categ
                     key_manager.mark_exhausted(key_idx)
                     cerebras_failed = True
 
-                    # If OpenRouter or Gemini backup is available, skip waiting — fallback NOW
-                    if (openrouter and openrouter.is_available()) or (gemini and gemini.is_available()):
+                    # If backup is available, skip waiting — fallback NOW
+                    if (nvidia and nvidia.is_available()) or (mistral and mistral.is_available()) or (openrouter and openrouter.is_available()) or (gemini and gemini.is_available()):
                         log.info(f"   [FALLBACK] Backup available — skipping exhausted Cerebras keys.")
                         break
                     continue
@@ -961,9 +1212,21 @@ def rewrite_article(key_manager: 'AIKeyManager', title: str, content: str, categ
                 if attempt < MAX_RETRIES:
                     time.sleep(2 * attempt)
 
+    # ── NVIDIA Fallback ──
+    if cerebras_failed and nvidia and nvidia.is_available():
+        log.info(f"   [FALLBACK] All Cerebras keys failed. Switching to NVIDIA...")
+        res = nvidia.rewrite(title, content, category)
+        if res: return res
+
+    # ── Mistral Fallback ──
+    if cerebras_failed and mistral and mistral.is_available():
+        log.info(f"   [FALLBACK] Switching to Mistral...")
+        res = mistral.rewrite(title, content, category)
+        if res: return res
+
     # ── OpenRouter Fallback ──
     if cerebras_failed and openrouter and openrouter.is_available():
-        log.info(f"   [FALLBACK] All Cerebras keys failed. Switching to OpenRouter...")
+        log.info(f"   [FALLBACK] Switching to OpenRouter...")
         res = openrouter.rewrite(title, content, category)
         if res: return res
 
@@ -1037,12 +1300,12 @@ def cleanup_old_data(sb: Client):
 
 # ─── Main Processing Loop ───────────────────────────────────────────────────
 
-def process_cycle(key_manager: 'AIKeyManager', sb: Client, tracker: URLTracker, openrouter: Optional['OpenRouterMiddle'] = None, gemini: Optional['GeminiBackup'] = None) -> tuple[int, bool]:
+def process_cycle(key_manager: 'AIKeyManager', sb: Client, tracker: URLTracker, nvidia: Optional['NvidiaFallback'] = None, mistral: Optional['MistralFallback'] = None, openrouter: Optional['OpenRouterMiddle'] = None, gemini: Optional['GeminiBackup'] = None) -> tuple[int, bool]:
     """
     One full processing cycle:
     1. Fetch RSS feed and filter for new content
     2. Scrape full article body
-    3. Analyze and rewrite using Cerebras/OpenRouter/Gemini AI (Reasoning Step)
+    3. Analyze and rewrite using Cerebras/NVIDIA/Mistral/OpenRouter/Gemini AI (Reasoning Step)
     4. Determine category (India vs International)
     5. Save to Supabase and track usage
     
@@ -1091,8 +1354,8 @@ def process_cycle(key_manager: 'AIKeyManager', sb: Client, tracker: URLTracker, 
                 continue
             log.info("   [INFO] Using RSS description as fallback content")
 
-        # Step 2: Pre-filter with smaller model (Cerebras Llama → OpenRouter Llama → Gemini Flash fallback)
-        filter_result = pre_filter_article(key_manager, article["title"], content, openrouter=openrouter, gemini=gemini)
+        # Step 2: Pre-filter with smaller model (Cerebras Llama → NVIDIA → Mistral → OpenRouter Llama → Gemini Flash fallback)
+        filter_result = pre_filter_article(key_manager, article["title"], content, nvidia=nvidia, mistral=mistral, openrouter=openrouter, gemini=gemini)
         
         if filter_result:
             raw_is_news = filter_result.get("is_news", True)
@@ -1111,9 +1374,9 @@ def process_cycle(key_manager: 'AIKeyManager', sb: Client, tracker: URLTracker, 
             
             article["category"] = filter_result.get("category", "india")
 
-        # Step 3: Rewrite with high-quality AI (Cerebras Qwen → OpenRouter Qwen → Gemini Pro fallback)
+        # Step 3: Rewrite with high-quality AI (Cerebras Qwen → NVIDIA → Mistral → OpenRouter Qwen → Gemini Pro fallback)
         qwen_used = True 
-        rewritten = rewrite_article(key_manager, article["title"], content, article["category"], openrouter=openrouter, gemini=gemini)
+        rewritten = rewrite_article(key_manager, article["title"], content, article["category"], nvidia=nvidia, mistral=mistral, openrouter=openrouter, gemini=gemini)
         
         if not rewritten:
             log.warning("   [SKIP] Rewrite failed. Breaking cycle to protect Qwen rate limits.")
@@ -1139,16 +1402,16 @@ def main():
     """Main entry point - runs the agent loop 24/7."""
 
     log.info("=" * 60)
-    log.info(">>> AirNews AI Agent (V10.1 - Cerebras + OpenRouter + Gemini Fallback) Starting")
+    log.info(">>> AirNews AI Agent (V10.3 - Cerebras + NVIDIA + Mistral + OpenRouter + Gemini) Starting")
     log.info("=" * 60)
     
     log.info(f"[CONFIG] Poll interval: {POLL_INTERVAL_SECONDS}s ({POLL_INTERVAL_SECONDS//60} min)")
     log.info(f"[CONFIG] Daily limit:   {DAILY_API_LIMIT} articles")
     log.info(f"[CONFIG] Per-cycle max: {MAX_ARTICLES_PER_CYCLE} articles")
-    log.info(f"[CONFIG] Backup:        OpenRouter (Middle) + Gemini (Last)")
+    log.info(f"[CONFIG] Fallback chain: Cerebras -> NVIDIA -> Mistral -> OpenRouter -> Gemini")
     log.info("")
 
-    key_manager, openrouter, gemini = init_ai()
+    key_manager, nvidia, mistral, openrouter, gemini = init_ai()
     sb = init_supabase()
     tracker = URLTracker(sb)
 
@@ -1166,7 +1429,7 @@ def main():
         log.info(f"{'---'*20}")
 
         try:
-            processed, qwen_used = process_cycle(key_manager, sb, tracker, openrouter=openrouter, gemini=gemini)
+            processed, qwen_used = process_cycle(key_manager, sb, tracker, nvidia=nvidia, mistral=mistral, openrouter=openrouter, gemini=gemini)
             log.info(f"[DONE] Cycle #{cycle_count}: {processed} articles processed")
         except Exception as e:
             log.error(f"[ERROR] Cycle #{cycle_count}: {e}")
@@ -1186,7 +1449,7 @@ def main():
             log.info(f"[SLEEP] Daily limit reached. Sleeping {int(sleep_time)}s until quota reset...")
         else:
             sleep_time = POLL_INTERVAL_SECONDS if qwen_used else 30
-            model_waited = "Qwen (180s)" if qwen_used else "Llama Scanner (30s)"
+            model_waited = "Qwen (60s)" if qwen_used else "Llama Scanner (30s)"
             log.info(f"[SLEEP] Next check in {sleep_time}s for {model_waited}...")
 
         for _ in range(int(sleep_time)):
