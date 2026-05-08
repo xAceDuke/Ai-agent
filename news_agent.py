@@ -47,10 +47,18 @@ BASE_DIR = Path(__file__).parent
 def clean_and_parse_json(raw_text: str) -> dict:
     """Safely extracts JSON from LLM outputs, stripping markdown formatting."""
     text = raw_text.strip()
-    # Remove markdown code block syntax if present
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\n", "", text)
-        text = re.sub(r"\n```$", "", text)
+    
+    # Find the first { and the last } to strictly extract JSON object
+    start = text.find('{')
+    end = text.rfind('}')
+    
+    if start != -1 and end != -1:
+        text = text[start:end+1]
+    else:
+        # Fallback to regex cleaning if braces aren't found
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        
     return json.loads(text.strip())
 LOG_FILE = BASE_DIR / "agent.log"
 
@@ -593,23 +601,22 @@ class AIKeyManager:
         for _ in range(len(self.keys)):
             idx = self.current_index
             if idx not in self.exhausted and now >= self.cooldowns[idx]:
+                self.current_index = (self.current_index + 1) % len(self.keys)
                 return self.clients[idx], idx
             
             self.current_index = (self.current_index + 1) % len(self.keys)
         
-        # Self-Healing Check: If all keys are exhausted, sleep instead of crashing
+        # Self-Healing Check: If all keys are exhausted, fail over instead of crashing/sleeping
         active_keys = [i for i in range(len(self.keys)) if i not in self.exhausted]
         if not active_keys:
-            log.error(f"[{self.provider_name}-MANAGER] ALL KEYS EXHAUSTED. Sleeping for 1 hour before retrying...")
-            time.sleep(3600)
-            self.exhausted.clear() # Clear memory to give them a fresh attempt
-            return self.clients[0], 0
+            log.warning(f"[{self.provider_name}-MANAGER] ALL KEYS EXHAUSTED.")
+            return None, -1
             
         best_idx = min(active_keys, key=lambda i: self.cooldowns[i])
         wait_time = max(0, self.cooldowns[best_idx] - now)
         if wait_time > 0:
-            log.info(f"[{self.provider_name}-MANAGER] All keys on cooldown. Waiting {int(wait_time)}s for Key #{best_idx}...")
-            time.sleep(wait_time)
+            log.warning(f"[{self.provider_name}-MANAGER] All keys on cooldown ({int(wait_time)}s left). Failing over...")
+            return None, -1
         
         return self.clients[best_idx], best_idx
 
@@ -649,6 +656,7 @@ class OpenRouterMiddle:
             log.info(f"   [OPENROUTER-FILTER] Attempting with {model_id}...")
             for attempt in range(1, 3): # 2 attempts per model for filtering
                 client, key_idx = self.manager.get_client()
+                if not client: break
                 try:
                     response = client.chat.completions.create(
                         model=model_id,
@@ -688,6 +696,7 @@ class OpenRouterMiddle:
             
             for attempt in range(1, model_retries + 1):
                 client, key_idx = self.manager.get_client()
+                if not client: break
                 try:
                     # Prepare extra body for reasoning if using openrouter/free
                     extra_body = {}
@@ -762,6 +771,7 @@ class NvidiaFallback:
         prompt = f"Title: {title}\n\nContent: {content[:2000]}"
         for attempt in range(1, 3):
             client, key_idx = self.manager.get_client()
+            if not client: break
             try:
                 response = client.chat.completions.create(
                     model=NVIDIA_FILTER_MODEL,
@@ -793,6 +803,7 @@ class NvidiaFallback:
         prompt = AI_REWRITE_PROMPT.format(title=title, content=content, category=category)
         for attempt in range(1, 3):
             client, key_idx = self.manager.get_client()
+            if not client: break
             try:
                 response = client.chat.completions.create(
                     model=NVIDIA_REWRITE_MODEL,
@@ -846,6 +857,7 @@ class MistralFallback:
         prompt = f"Title: {title}\n\nContent: {content[:2000]}"
         for attempt in range(1, 3):
             client, key_idx = self.manager.get_client()
+            if not client: break
             try:
                 response = client.chat.completions.create(
                     model=MISTRAL_FILTER_MODEL,
@@ -875,6 +887,7 @@ class MistralFallback:
         prompt = AI_REWRITE_PROMPT.format(title=title, content=content, category=category)
         for attempt in range(1, 3):
             client, key_idx = self.manager.get_client()
+            if not client: break
             try:
                 response = client.chat.completions.create(
                     model=MISTRAL_REWRITE_MODEL,
@@ -928,6 +941,7 @@ class GeminiBackup:
         prompt = f"{PRE_FILTER_PROMPT}\n\nTitle: {title}\n\nContent: {content[:2000]}"
         for attempt in range(1, 4): # 3 retries for Gemini
             client, key_idx = self.manager.get_client()
+            if not client: break
             try:
                 response = client.models.generate_content(
                     model=GEMINI_FILTER_MODEL,
@@ -963,6 +977,7 @@ class GeminiBackup:
         prompt = f"{SYSTEM_PROMPT}\n\n{AI_REWRITE_PROMPT.format(title=title, content=content, category=category)}"
         for attempt in range(1, 4):
             client, key_idx = self.manager.get_client()
+            if not client: break
             try:
                 response = client.models.generate_content(
                     model=GEMINI_REWRITE_MODEL,
@@ -1024,6 +1039,9 @@ def pre_filter_article(key_manager: 'AIKeyManager', title: str, content: str, nv
         # Try available Cerebras keys
         for attempt in range(len(key_manager.keys)):
             client, key_idx = key_manager.get_client()
+            if not client:
+                cerebras_failed = True
+                break
             try:
                 response = client.chat.completions.create(
                     model=FILTER_MODEL,
@@ -1163,6 +1181,9 @@ def rewrite_article(key_manager: 'AIKeyManager', title: str, content: str, categ
         max_attempts = max(MAX_RETRIES, len(key_manager.keys))
         for attempt in range(1, max_attempts + 1):
             client, key_idx = key_manager.get_client()
+            if not client:
+                cerebras_failed = True
+                break
             
             try:
                 response = client.chat.completions.create(
@@ -1213,6 +1234,13 @@ def rewrite_article(key_manager: 'AIKeyManager', title: str, content: str, categ
                         except: pass
                     
                     key_manager.mark_cooldown(key_idx, wait_time)
+                    
+                    now = time.time()
+                    any_available = any(i not in key_manager.exhausted and now >= key_manager.cooldowns[i] for i in range(len(key_manager.keys)))
+                    if any_available:
+                        log.info(f"   [RETRY] Next Cerebras key is available. Retrying...")
+                        continue
+
                     cerebras_failed = True
                     if (nvidia and nvidia.is_available()) or (mistral and mistral.is_available()) or (openrouter and openrouter.is_available()) or (gemini and gemini.is_available()):
                         log.info(f"   [FALLBACK] Backup available — skipping Cerebras cooldown wait.")
@@ -1222,6 +1250,13 @@ def rewrite_article(key_manager: 'AIKeyManager', title: str, content: str, categ
                 # Handle exhaustion
                 if "daily limit" in error_msg:
                     key_manager.mark_exhausted(key_idx)
+                    
+                    now = time.time()
+                    any_available = any(i not in key_manager.exhausted and now >= key_manager.cooldowns[i] for i in range(len(key_manager.keys)))
+                    if any_available:
+                        log.info(f"   [RETRY] Next Cerebras key is available. Retrying...")
+                        continue
+                        
                     cerebras_failed = True
 
                     # If backup is available, skip waiting — fallback NOW
@@ -1387,15 +1422,17 @@ def process_cycle(key_manager: 'AIKeyManager', sb: Client, tracker: URLTracker, 
             else:
                 is_news = bool(raw_is_news)
 
-            if not is_news:
+            article["category"] = filter_result.get("category", article.get("category", "india"))
+
+            if not is_news and article["category"].lower() == "india":
                 log.info(f"   [IGNORE] Non-news detected by pre-filter. Skipping...")
                 save_ignored_article_supabase(sb, article, {"thought_process": filter_result.get("reason", "")})
                 tracker.mark_visited(article["url"])
                 # SAFETY DELAY: Prevents hitting Llama 30 RPM limit if batch is full of junk
                 time.sleep(2) 
                 continue 
-            
-            article["category"] = filter_result.get("category", "india")
+            elif not is_news:
+                log.info(f"   [INFO] Pre-filter rejected but category is '{article['category']}'. Proceeding anyway.")
 
         # Step 3: Rewrite with high-quality AI (Cerebras Qwen → NVIDIA → Mistral → OpenRouter Qwen → Gemini Pro fallback)
         qwen_used = True 
