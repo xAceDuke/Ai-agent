@@ -60,11 +60,25 @@ RSS_FEED_URLS = [
     {"url": "https://feeds.feedburner.com/ndtvnews-india-news", "category": "india", "name": "NDTV India"},
     {"url": "https://feeds.feedburner.com/ndtvnews-world-news", "category": "international", "name": "NDTV World"},
     {"url": "https://www.thehindu.com/news/national/feeder/default.rss", "category": "india", "name": "The Hindu National"},
-    {"url": "https://www.thehindu.com/news/international/feeder/default.rss", "category": "international", "name": "The Hindu International"}
+    {"url": "https://www.thehindu.com/news/international/feeder/default.rss", "category": "international", "name": "The Hindu International"},
+    {"url": "https://www.thehindu.com/business/feeder/default.rss", "category": "business", "name": "The Hindu Business"},
+    {"url": "http://timesofindia.indiatimes.com/rssfeeds/1898055.cms", "category": "business", "name": "TOI Business"},
+    {"url": "https://www.thehindu.com/entertainment/movies/feeder/default.rss", "category": "cinema", "name": "The Hindu Movies"},
+    {"url": "http://feeds.feedburner.com/ndtvmovies-bollywood", "category": "cinema", "name": "NDTV Bollywood"},
+    {"url": "http://feeds.feedburner.com/ndtvmovies-hollywood", "category": "cinema", "name": "NDTV Hollywood"},
+    {"url": "http://feeds.feedburner.com/ndtvmovies-regional", "category": "cinema", "name": "NDTV Regional"},
+    {"url": "http://feeds.feedburner.com/ndtvmovies-television", "category": "cinema", "name": "NDTV Television"},
+    {"url": "http://feeds.feedburner.com/ndtvmovies-music", "category": "cinema", "name": "NDTV Music"},
+    {"url": "http://feeds.feedburner.com/ndtvmovies-moviereviews", "category": "cinema", "name": "NDTV Movie Reviews"},
+    {"url": "http://feeds.feedburner.com/ndtvmovies-latest", "category": "cinema", "name": "NDTV Latest"},
+    {"url": "https://www.thehindu.com/sport/feeder/default.rss", "category": "sports", "name": "The Hindu Sports"},
+    {"url": "http://timesofindia.indiatimes.com/rssfeeds/4719148.cms", "category": "sports", "name": "TOI Sports"},
+    {"url": "http://timesofindia.indiatimes.com/rssfeeds/54829575.cms", "category": "sports", "name": "TOI Sports Other"},
+    {"url": "https://www.autocarpro.in/rssfeeds/all", "category": "auto", "name": "Autocar Pro"}
 ]
 POLL_INTERVAL_SECONDS = 60           # 1 minute between cycles (Respects 1 RPM)
 MAX_ARTICLES_PER_CYCLE = 25          # Scan up to 25 articles per cycle (mostly for filtering)
-DAILY_API_LIMIT = 250                # Protects token quota (approx 1M tokens/day)
+DAILY_API_LIMIT = 1000               # Protects token quota (approx 1M tokens/day)
 MAX_RETRIES = 5                      # retries on transient errors (Upgraded to 5 for stability)
 ARTICLE_FETCH_TIMEOUT = 15           # seconds for HTTP requests
 
@@ -310,9 +324,8 @@ def fetch_rss_feed() -> list[dict]:
                 # Real trash paths identified directly from the live RSS feeds
                 # Filtering down to pure news (excluding health, offbeat, features, opinions, etc.)
                 live_trash_sections = {
-                    "health", "offbeat", "feature", "opinion", "business", 
-                    "business-economy", "education", "entertainment", "sports",
-                    "cricket", "lifestyle", "astrology", "movies", "tv"
+                    "health", "offbeat", "feature", "opinion",
+                    "education", "lifestyle", "astrology"
                 }
                 
                 if not article_url or root_section in live_trash_sections or "/health/" in article_url.lower() or "/offbeat/" in article_url.lower():
@@ -432,6 +445,12 @@ def scrape_article_content(url: str) -> Optional[str]:
             {"id": lambda x: x and x.startswith("content-body-")}, # The Hindu primary
             {"class_": "article-body-container"},           # The Hindu alternate
             {"class_": "content-body"},                     # The Hindu alternate
+            {"class_": "detail-content"},                   # Autocar Pro generic
+            {"class_": "news-content"},                     # Autocar Pro generic
+            {"class_": "post-content"},                     # Autocar Pro generic
+            {"class_": "sp-cn"},                            # NDTV Movies
+            {"class_": "story__content"},                   # NDTV Generic
+            {"class_": "article-content"},                  # Generic
             {"itemprop": "articleBody"},                    # Generic standard
             {"class_": "article-body"},                     # Generic standard
             "article",                                      # Semantic standard
@@ -527,6 +546,10 @@ Criteria for 'is_news: true':
 - Timely reporting on a specific event (Government, Law, Conflict, Disasters).
 - OFFICIAL Indian news (Policy, Legal, Major Accidents).
 - INTERNATIONAL FLEXIBILITY: For international news, you may allow high-impact analytical reports, major scientific breakthroughs, or significant geopolitical features that provide global context.
+- BUSINESS & ECONOMY: Market reports, corporate earnings, policy changes, and economic data are fully allowed.
+- CINEMA & ENTERTAINMENT: Major film announcements, industry news, and significant events are allowed. Exclude petty gossip.
+- SPORTS: Major sporting events, match reports, and significant sports news are allowed.
+- AUTO & AUTOMOBILE: New vehicle launches, industry policies, and major auto sector news are allowed.
 
 Criteria for 'is_news: false':
 - Low-quality gossip, viral social media memes, or celebrity rumors.
@@ -539,7 +562,7 @@ IMPORTANT: Trust the source article's claims about events occurring NOW. Do NOT 
 Return ONLY a JSON object:
 {{
   "is_news": boolean,
-  "category": "india" or "international",
+  "category": "india" or "international" or "business" or "cinema" or "sports" or "auto",
   "reason": "One sentence explanation"
 }}
 """
