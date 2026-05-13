@@ -1,8 +1,9 @@
 """
-AirNews AI Agent (V10.3 - Cerebras + NVIDIA + Mistral + OpenRouter + Gemini Fallback)
+AirNews AI Agent (V10.5 - Cerebras + NVIDIA + Mistral + OpenRouter + Gemini + R2)
 ========================================================
 Fetches RSS feeds from TOI, Times Now, NDTV, and The Hindu, scrapes full articles,
 pre-filters via Llama-8B, rewrites via Cerebras Qwen-235B, and saves to Supabase.
+Images are self-hosted on Cloudflare R2 with CDN delivery.
 
 Key Features:
 - Reasoning-First Architecture: Forces Qwen to analyze situational context and projections.
@@ -10,6 +11,9 @@ Key Features:
   and Qwen-2.5-235B for high-quality editorial rewriting (1 RPM).
 - Multi-Tier Fallback: Falls back to NVIDIA NIM (Llama 3.1), then Mistral (Large), 
   then OpenRouter (Free), and finally Gemini when primary providers are limited.
+- R2 Image Storage: Downloads article images and uploads to Cloudflare R2 (zero conversion).
+- 30-Day Data Retention: Daily cleanup purges old articles, URLs, and R2 images.
+- Long-Running Stability: Rotating logs, daily state resets, stale connection recovery.
 - Strict 'Hard News Only' Policy: Blocks speculative political commentary and features.
 - Strict Pacing: Automatically sleeps for 60s after every successful rewrite (1 RPM).
 - Self-Healing: Gracefully handles API exhaustion without crashing.
@@ -17,11 +21,13 @@ Key Features:
 
 import os
 import re
+import io
 import sys
 import json
 import time
 import hashlib
 import logging
+from logging.handlers import RotatingFileHandler
 import signal
 import traceback
 from datetime import datetime, timezone, timedelta
@@ -39,6 +45,12 @@ from google import genai
 from google.genai import types
 
 from supabase import create_client, Client
+
+try:
+    import boto3
+    R2_AVAILABLE = True
+except ImportError:
+    R2_AVAILABLE = False
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -160,7 +172,7 @@ Original Content: {content}
 # ─── Logging Setup ───────────────────────────────────────────────────────────
 
 def setup_logging():
-    """Configure dual logging to file and console with safe encoding."""
+    """Configure dual logging to file (rotating) and console with safe encoding."""
     logger = logging.getLogger("NewsAgent")
     logger.setLevel(logging.INFO)
 
@@ -169,8 +181,11 @@ def setup_logging():
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    # File handler (append mode, UTF-8)
-    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    # Rotating file handler — 10MB max, keep 5 backups (~50MB total)
+    # Prevents log file from growing forever (was ~1MB/day = 365MB/year)
+    fh = RotatingFileHandler(
+        LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding="utf-8"
+    )
     fh.setLevel(logging.INFO)
     fh.setFormatter(formatter)
     logger.addHandler(fh)
@@ -305,6 +320,7 @@ class URLTracker:
 
 def fetch_rss_feed() -> list[dict]:
     """Fetch and parse the RSS feeds. Returns list of article dicts."""
+    import socket
     all_articles = []
     
     for feed_info in RSS_FEED_URLS:
@@ -312,7 +328,14 @@ def fetch_rss_feed() -> list[dict]:
         category = feed_info["category"]
         feed_name = feed_info["name"]
         try:
-            feed = feedparser.parse(feed_url)
+            # Set socket timeout to prevent feedparser from hanging forever
+            # on a dead/unresponsive RSS server (feedparser has NO built-in timeout)
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(15)
+            try:
+                feed = feedparser.parse(feed_url)
+            finally:
+                socket.setdefaulttimeout(old_timeout)
 
             if feed.bozo and not feed.entries:
                 log.warning(f"[WARN] RSS feed parse error for {feed_url}: {feed.bozo_exception}")
@@ -1297,16 +1320,21 @@ def rewrite_article(key_manager: 'AIKeyManager', title: str, content: str, categ
 
 # ─── Supabase Writer ─────────────────────────────────────────────────────────
 
-def save_article_supabase(sb: Client, article_data: dict, rewritten: dict) -> bool:
-    """Save the rewritten article to Supabase."""
+def save_article_supabase(sb: Client, article_data: dict, rewritten: dict, r2_manager: Optional['R2ImageManager'] = None) -> bool:
+    """Save the rewritten article to Supabase. Uploads image to R2 if available."""
     url_hash = hashlib.md5(article_data["url"].encode()).hexdigest()[:10]
-    
+
+    # Upload image to R2 (falls back to original URL on failure)
+    image_url = article_data.get("image_url", "")
+    if r2_manager and r2_manager.is_available() and image_url:
+        image_url = r2_manager.process_image(image_url, url_hash)
+
     output = {
         "id": url_hash,
         "original_url": article_data["url"],
         "original_title": article_data["title"],
         "published_date": article_data["published"],
-        "image_url": article_data.get("image_url", ""),
+        "image_url": image_url,
         "rewritten_headline": rewritten["headline"],
         "rewritten_summary": rewritten["summary"],
         "rewritten_body": rewritten["body"],
@@ -1343,22 +1371,160 @@ def save_ignored_article_supabase(sb: Client, article: dict, rewritten: dict):
     except Exception as e:
         log.error(f"[ERROR] Failed to save to ignored_articles: {e}")
 
+# ─── R2 Image Manager ────────────────────────────────────────────────────────
+
+class R2ImageManager:
+    """Downloads article images, uploads to Cloudflare R2."""
+
+    def __init__(self):
+        if not R2_AVAILABLE:
+            self.client = None
+            log.warning("[R2] boto3 not installed. Images will use original URLs.")
+            return
+
+        load_dotenv(BASE_DIR / ".env", override=True)
+        self.account_id = os.getenv("R2_ACCOUNT_ID")
+        self.bucket = os.getenv("R2_BUCKET_NAME", "airnews-images")
+        self.public_url = os.getenv("R2_PUBLIC_URL", "").rstrip("/")
+        access_key = os.getenv("R2_ACCESS_KEY_ID")
+        secret_key = os.getenv("R2_SECRET_ACCESS_KEY")
+
+        if not all([self.account_id, access_key, secret_key, self.public_url]):
+            self.client = None
+            log.warning("[R2] Missing R2 credentials in .env. Images will use original URLs.")
+            return
+
+        self.client = boto3.client(
+            's3',
+            endpoint_url=f'https://{self.account_id}.r2.cloudflarestorage.com',
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name='auto'
+        )
+        log.info(f"[R2] Initialized — bucket={self.bucket}, url={self.public_url}")
+
+    def is_available(self) -> bool:
+        return self.client is not None
+
+    def process_image(self, image_url: str, article_hash: str) -> str:
+        """Download image and upload to R2 as-is (no conversion, zero quality loss).
+        Returns R2 URL or original on failure."""
+        if not self.client or not image_url:
+            return image_url
+
+        try:
+            # Download image from external source
+            resp = requests.get(image_url, impersonate="chrome110", timeout=15)
+            resp.raise_for_status()
+
+            # Detect content type and file extension
+            content_type = resp.headers.get("content-type", "image/jpeg")
+            if not content_type.startswith("image/") and len(resp.content) < 1000:
+                log.warning(f"   [R2] Skipped — not an image (content-type={content_type})")
+                return image_url
+
+            # Map content-type to file extension
+            ext_map = {
+                "image/jpeg": ".jpg", "image/jpg": ".jpg",
+                "image/png": ".png", "image/webp": ".webp",
+                "image/gif": ".gif", "image/avif": ".avif",
+            }
+            ext = ext_map.get(content_type.split(";")[0].strip(), ".jpg")
+
+            # Upload original image to R2 (no conversion — zero quality loss)
+            buffer = io.BytesIO(resp.content)
+            key = f"articles/{article_hash}{ext}"
+            self.client.upload_fileobj(
+                buffer, self.bucket, key,
+                ExtraArgs={
+                    "ContentType": content_type.split(";")[0].strip(),
+                    "CacheControl": "public, max-age=2592000"  # 30 days CDN cache
+                }
+            )
+
+            r2_url = f"{self.public_url}/{key}"
+            size_kb = len(resp.content) // 1024
+            log.info(f"   [R2] Uploaded {size_kb}KB ({ext}) → {key}")
+            return r2_url
+
+        except Exception as e:
+            log.warning(f"   [R2] Image upload failed, using original URL: {e}")
+            return image_url
+
+    def delete_image(self, article_hash: str, image_url: str = ""):
+        """Delete an image from R2. Uses image_url to find exact key,
+        falls back to trying common extensions."""
+        if not self.client:
+            return
+
+        # Smart path: extract exact key from the stored R2 URL
+        if image_url and self.public_url and image_url.startswith(self.public_url):
+            try:
+                key = image_url.replace(self.public_url + "/", "", 1)
+                self.client.delete_object(Bucket=self.bucket, Key=key)
+                return
+            except Exception:
+                pass
+
+        # Fallback: try all common extensions
+        for ext in [".jpg", ".png", ".webp", ".gif", ".avif"]:
+            try:
+                key = f"articles/{article_hash}{ext}"
+                self.client.delete_object(Bucket=self.bucket, Key=key)
+            except Exception:
+                pass
+
 # ─── Data Cleanup ────────────────────────────────────────────────────────────
 
-def cleanup_old_data(sb: Client):
-    """Delete articles and visited_urls older than 30 days to maintain DB size."""
+_last_cleanup_date = ""
+
+def cleanup_old_data(sb: Client, r2_manager: Optional['R2ImageManager'] = None):
+    """Delete articles, visited_urls, and ignored_articles older than 30 days.
+    Runs once per calendar day to avoid spamming DELETE queries every cycle."""
+    global _last_cleanup_date
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _last_cleanup_date == today:
+        return  # Already ran today
+
+    _last_cleanup_date = today
+    thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    log.info(f"[CLEANUP] Running daily cleanup — purging data older than 30 days...")
+
     try:
-        thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-        
+        # 1. Get article IDs before deleting (for R2 image cleanup)
+        old_articles = sb.table("articles").select("id, image_url") \
+            .lt("processed_at", thirty_days_ago).execute()
+
+        article_count = len(old_articles.data) if old_articles.data else 0
+
+        # 2. Delete R2 images for old articles
+        if r2_manager and r2_manager.is_available() and old_articles.data:
+            r2_deleted = 0
+            r2_skipped = 0
+            for article in old_articles.data:
+                img_url = article.get("image_url", "")
+                # Only delete if it's hosted on our R2 (skip legacy external URLs)
+                if img_url and r2_manager.public_url and img_url.startswith(r2_manager.public_url):
+                    r2_manager.delete_image(article["id"], image_url=img_url)
+                    r2_deleted += 1
+                else:
+                    r2_skipped += 1
+            log.info(f"[CLEANUP] R2 images: {r2_deleted} deleted, {r2_skipped} skipped (external)")
+
+        # 3. Delete from Supabase tables
         sb.table("articles").delete().lt("processed_at", thirty_days_ago).execute()
         sb.table("visited_urls").delete().lt("visited_at", thirty_days_ago).execute()
         sb.table("ignored_articles").delete().lt("processed_at", thirty_days_ago).execute()
+
+        log.info(f"[CLEANUP] Purged {article_count} articles + visited_urls + ignored_articles")
+
     except Exception as e:
         log.error(f"[ERROR] Cleanup failed: {e}")
 
 # ─── Main Processing Loop ───────────────────────────────────────────────────
 
-def process_cycle(key_manager: 'AIKeyManager', sb: Client, tracker: URLTracker, nvidia: Optional['NvidiaFallback'] = None, mistral: Optional['MistralFallback'] = None, openrouter: Optional['OpenRouterMiddle'] = None, gemini: Optional['GeminiBackup'] = None) -> tuple[int, bool]:
+def process_cycle(key_manager: 'AIKeyManager', sb: Client, tracker: URLTracker, nvidia: Optional['NvidiaFallback'] = None, mistral: Optional['MistralFallback'] = None, openrouter: Optional['OpenRouterMiddle'] = None, gemini: Optional['GeminiBackup'] = None, r2_manager: Optional['R2ImageManager'] = None) -> tuple[int, bool]:
     """
     One full processing cycle:
     1. Fetch RSS feed and filter for new content
@@ -1443,7 +1609,7 @@ def process_cycle(key_manager: 'AIKeyManager', sb: Client, tracker: URLTracker, 
             break 
 
         # Step 4: Save to Supabase
-        save_article_supabase(sb, article, rewritten)
+        save_article_supabase(sb, article, rewritten, r2_manager=r2_manager)
 
         # Step 5: Track and End Cycle
         tracker.mark_visited(article["url"])
@@ -1453,7 +1619,7 @@ def process_cycle(key_manager: 'AIKeyManager', sb: Client, tracker: URLTracker, 
         log.info(f"   [DONE] News processed. Ending cycle to respect 1 RPM limit.")
         break
 
-    cleanup_old_data(sb)
+    cleanup_old_data(sb, r2_manager=r2_manager)
 
     return processed, qwen_used
 
@@ -1462,7 +1628,7 @@ def main():
     """Main entry point - runs the agent loop 24/7."""
 
     log.info("=" * 60)
-    log.info(">>> AirNews AI Agent (V10.3 - Cerebras + NVIDIA + Mistral + OpenRouter + Gemini) Starting")
+    log.info(">>> AirNews AI Agent (V10.5 - Cerebras + NVIDIA + Mistral + OpenRouter + Gemini + R2) Starting")
     log.info("=" * 60)
     
     log.info(f"[CONFIG] Poll interval: {POLL_INTERVAL_SECONDS}s ({POLL_INTERVAL_SECONDS//60} min)")
@@ -1473,6 +1639,7 @@ def main():
 
     key_manager, nvidia, mistral, openrouter, gemini = init_ai()
     sb = init_supabase()
+    r2_manager = R2ImageManager()
     tracker = URLTracker(sb)
 
     log.info(f"[STATS] Previously processed: {tracker.total_articles} articles")
@@ -1480,16 +1647,49 @@ def main():
     log.info("")
 
     cycle_count = 0
+    last_daily_reset = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     while not _shutdown_requested:
         cycle_count += 1
+
+        # ── Daily Midnight Reset ──────────────────────────────────────
+        # Reset state that accumulates over the day to prevent staleness
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != last_daily_reset:
+            last_daily_reset = today
+            log.info("[RESET] New day detected — resetting daily state...")
+
+            # 1. Reset AI key exhaustion flags (keys become usable again)
+            key_manager.exhausted.clear()
+            key_manager.cooldowns = {i: 0 for i in range(len(key_manager.keys))}
+            if nvidia: nvidia.manager.exhausted.clear()
+            if mistral: mistral.manager.exhausted.clear()
+            if openrouter: openrouter.manager.exhausted.clear()
+            if gemini: gemini.manager.exhausted.clear()
+            log.info("[RESET] All AI key exhaustion flags cleared")
+
+            # 2. Re-initialize Supabase client (connections go stale after hours)
+            try:
+                sb = init_supabase()
+                tracker.sb = sb
+                log.info("[RESET] Supabase client re-initialized")
+            except Exception as e:
+                log.error(f"[RESET] Supabase re-init failed (using existing): {e}")
+
+            # 3. Prune visited set (prevents unbounded memory growth)
+            # At 2K articles/day × 30 days = 60K URLs in memory
+            old_size = len(tracker.visited)
+            tracker.visited.clear()
+            tracker._load()
+            log.info(f"[RESET] Visited set pruned: {old_size} → {len(tracker.visited)} URLs")
+
         log.info(f"\n{'---'*20}")
-        log.info(f"[CYCLE #{cycle_count}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        log.info(f"[CYCLE #{cycle_count}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | mem={len(tracker.visited)} URLs tracked")
         log.info(f"   Daily API usage: {tracker.get_daily_count()}/{DAILY_API_LIMIT}")
         log.info(f"{'---'*20}")
 
         try:
-            processed, qwen_used = process_cycle(key_manager, sb, tracker, nvidia=nvidia, mistral=mistral, openrouter=openrouter, gemini=gemini)
+            processed, qwen_used = process_cycle(key_manager, sb, tracker, nvidia=nvidia, mistral=mistral, openrouter=openrouter, gemini=gemini, r2_manager=r2_manager)
             log.info(f"[DONE] Cycle #{cycle_count}: {processed} articles processed")
         except Exception as e:
             log.error(f"[ERROR] Cycle #{cycle_count}: {e}")
