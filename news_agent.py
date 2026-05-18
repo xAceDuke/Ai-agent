@@ -1,21 +1,20 @@
 """
-AirNews AI Agent (V10.5 - Cerebras + NVIDIA + Mistral + OpenRouter + Gemini + R2)
-========================================================
+AirNews AI Agent (V11.0 - Production-Ready, Live-Audited)
+==========================================================
 Fetches RSS feeds from TOI, Times Now, NDTV, and The Hindu, scrapes full articles,
 pre-filters via Llama-8B, rewrites via Cerebras Qwen-235B, and saves to Supabase.
 Images are self-hosted on Cloudflare R2 with CDN delivery.
 
 Key Features:
-- Reasoning-First Architecture: Forces Qwen to analyze situational context and projections.
-- Dual-Model Filtering: Uses Llama-3.1-8B for high-throughput scanning (30 RPM)
-  and Qwen-2.5-235B for high-quality editorial rewriting (1 RPM).
-- Multi-Tier Fallback: Falls back to NVIDIA NIM (Llama 3.1), then Mistral (Large), 
-  then OpenRouter (Free), and finally Gemini when primary providers are limited.
-- R2 Image Storage: Downloads article images and uploads to Cloudflare R2 (zero conversion).
+- Live-Audited Filters: RSS, URL, and title-level filters verified against real feed data.
+- Three-Layer Trash Detection: URL path, URL fragment keywords, and title prefix/keyword.
+- Paywall Guard: Articles with <200-char body are rejected before DB write.
+- Cross-Reference Noise Removal: 'Also Read', 'Related:' paragraphs stripped at scrape time.
+- Category-Aware Prompting: Hard news, cinema, sports, and auto each use tailored prompts.
+- Multi-Tier Fallback: Cerebras → NVIDIA → Mistral → OpenRouter → Gemini.
+- R2 Image Storage: Downloads article images and uploads to Cloudflare R2.
 - 30-Day Data Retention: Daily cleanup purges old articles, URLs, and R2 images.
 - Long-Running Stability: Rotating logs, daily state resets, stale connection recovery.
-- Strict 'Hard News Only' Policy: Blocks speculative political commentary and features.
-- Strict Pacing: Automatically sleeps for 60s after every successful rewrite (1 RPM).
 - Self-Healing: Gracefully handles API exhaustion without crashing.
 """
 
@@ -128,40 +127,36 @@ HTTP_HEADERS = {
     "Referer": "https://www.google.com/",
 }
 
-SYSTEM_PROMPT = """You are an elite senior news editor for AirNews, specializing in high-impact hard news reporting. Your goal is to produce news stories that sound like urgent, authoritative dispatches from a global news agency (like Reuters, AP, or PTI).
+SYSTEM_PROMPT = """You are an elite senior editor for AirNews, a multi-category Indian news platform. You write authoritative, professional content across all beats: hard news, entertainment, sports, and automotive.
 
 EDITORIAL PRINCIPLES:
-1. STRICT FACTUAL ACCURACY: You must STRICTLY rely ONLY on the provided original news text for facts. Do NOT make assumptions, do NOT make up facts, and do NOT correct facts. If a date or time is not explicitly stated in the source, do not invent one. Do NOT use past dates as current dates. The original text is your absolute and only source of truth.
-2. HARD NEWS TONE: Write in a direct, punchy, and objective journalistic style. Avoid flowery language or "blog-style" prose. The news must sound immediate and factual.
+1. CATEGORY AWARENESS: Adapt your writing style to the content category. Hard news uses wire-service style; cinema uses entertainment journalism; sports uses match-report style; auto uses consumer-review style.
+2. ALWAYS PRODUCE CONTENT: You MUST always produce a full article. NEVER output "No News Event Reported" or any refusal. If the content is thin, summarise what is available and produce the best article you can.
 3. BALANCED OBJECTIVITY: Maintain strict neutrality. Report the facts and their direct consequences without personal bias.
 4. GEOPOLITICAL DISAMBIGUATION: Always verify the identity of people mentioned. For example, if 'Stalin' is mentioned in context of Tamil Nadu, it is Chief Minister M.K. Stalin.
-5. GEOGRAPHICAL PRECISION: Clearly distinguish between domestic (Indian) and international news based on locations and entities.
-6. JOURNALISTIC STRUCTURE: Prioritize the most important information first (Inverted Pyramid). The lead must be strong and fact-dense.
-7. FACTUAL TRUST: Trust the provided source article as the primary source of truth for current events. Do NOT reject news simply because it is newer than your training data. Never inject your own outside knowledge.
-8. NEWS VS. ARTICLE: You must distinguish between a 'Hard News' event (e.g., 'A law was enacted', 'A major accident occurred') and 'Features/Commentary' (e.g., 'The significance of X', 'Why Y happened'). Your output must ALWAYS sound like the former—a factual news report.
-9. CONCISION: Every word must count. Eliminate fluff, redundant adjectives, and unnecessary filler phrases.
+5. FACTUAL TRUST: Trust the provided source article as the primary source of truth for current events. Do NOT reject content simply because the event is newer than your training data.
+6. CONCISION: Every word must count. Eliminate fluff, redundant adjectives, and unnecessary filler phrases.
+7. ZERO AI CLICHÉS: DO NOT use phrases like "delving into," "testament to," "in a significant move," or "moreover."
 """
 
 
-AI_REWRITE_PROMPT = """Rewrite the provided news article into a professional news report. 
+# ─── Category-Aware Rewrite Prompts ─────────────────────────────────────────
 
-Your goal is to produce a version that is authoritative, objective, and sounds like a news agency dispatch. It should deliver the facts clearly and concisely.
+_PROMPT_HARD_NEWS = """Rewrite the provided article into a professional hard-news report.
 
 EDITORIAL REQUIREMENTS:
-1. ABSOLUTE SOURCE FIDELITY: Rely strictly and only on the original content provided below. Do NOT hallucinate dates, do NOT make assumptions, do NOT add external knowledge, and do NOT attempt to "correct" the facts. If the date of an event isn't in the text, do not invent one or assume a past date.
-2. NEWS AGENCY STYLE: Write as if for a global wire service. Use active voice and direct attribution.
-3. INVERTED PYRAMID: Put the most critical facts (Who, What, Where, When, Why) in the first paragraph based ONLY on what is available in the source.
-4. NO FEATURE FLUFF: Avoid "insightful analysis" or "deep dives" that make it sound like a magazine article. Keep it to the hard facts and their immediate context.
-5. OUTLOOK SECTION: While the focus is on the "Now", the final paragraph should briefly mention the immediate next steps or official responses ONLY IF present in the source text.
-6. ZERO AI CLICHÉS: DO NOT use phrases like "delving into," "testament to," "in a significant move," or "moreover."
-7. FORMAT: Create a punchy, news-style headline and a 2-sentence summary. The body should consist of 3-5 concise paragraphs separated by "NEWPARA".
+1. NEWS AGENCY STYLE: Write as if for a global wire service (Reuters/PTI). Use active voice and direct attribution.
+2. INVERTED PYRAMID: Put the most critical facts (Who, What, Where, When, Why) in the first paragraph.
+3. NO FEATURE FLUFF: Keep it to the hard facts and their immediate context.
+4. OUTLOOK SECTION: The final paragraph should briefly mention immediate next steps or official responses.
+5. FORMAT: Create a punchy, news-style headline and a 2-sentence summary. Body: 3-5 paragraphs separated by "NEWPARA".
 
 Return ONLY a JSON object:
 {{
-  "thought_process": "Brief internal analysis confirming strict adherence to the source text and avoiding hallucinated facts/dates.",
-  "headline": "Hard News Headline (e.g., 'Government Announces New Export Policy')",
-  "summary": "Urgent executive summary of the event.",
-  "body": "Paragraph 1 (The Lead) NEWPARA Paragraph 2 (Details) NEWPARA ... (Ensure the final paragraph mentions immediate outlook)",
+  "thought_process": "Brief internal analysis of the key news facts and the reporting plan.",
+  "headline": "Hard News Headline",
+  "summary": "2-sentence executive summary of the event.",
+  "body": "Lead paragraph NEWPARA Details paragraph NEWPARA ... NEWPARA Outlook paragraph",
   "tags": ["tag1", "tag2", "tag3", "tag4", "tag5"]
 }}
 
@@ -169,6 +164,90 @@ Article Category: {category}
 Original Title: {title}
 Original Content: {content}
 """
+
+_PROMPT_CINEMA = """Rewrite the provided entertainment/cinema article into a polished entertainment news piece suitable for a professional Indian news platform.
+
+EDITORIAL REQUIREMENTS:
+1. ENTERTAINMENT JOURNALISM STYLE: Engaging yet professional. This is NOT hard news — it is entertainment journalism. Reviews, announcements, and industry news are all valid.
+2. FILM REVIEWS: If the source is a movie review, write a concise, opinionated critical piece with a clear verdict. Include: overall rating impression, performances, direction, and whether it is worth watching.
+3. FILM ANNOUNCEMENTS / INDUSTRY NEWS: Report factually — cast, release date, production details, box office figures.
+4. LEAD: Open with the most important fact or your sharpest observation.
+5. FORMAT: Create an engaging headline and a 2-sentence hook summary. Body: 3-5 paragraphs separated by "NEWPARA".
+
+Return ONLY a JSON object:
+{{
+  "thought_process": "Brief analysis of the content and writing approach.",
+  "headline": "Engaging cinema/entertainment headline",
+  "summary": "2-sentence hook that draws the reader in.",
+  "body": "Opening paragraph NEWPARA Details paragraph NEWPARA ... NEWPARA Verdict/Outlook paragraph",
+  "tags": ["tag1", "tag2", "tag3", "tag4", "tag5"]
+}}
+
+Article Category: {category}
+Original Title: {title}
+Original Content: {content}
+"""
+
+_PROMPT_SPORTS = """Rewrite the provided sports article into a sharp, energetic sports report for a professional Indian news platform.
+
+EDITORIAL REQUIREMENTS:
+1. SPORTS JOURNALISM STYLE: Direct and exciting. Lead with the result or the most dramatic moment.
+2. MATCH REPORTS: Include the final score, key performers, turning points, and standings impact.
+3. SPORTS NEWS: For transfers, injuries, selection news — be factual and concise.
+4. OUTLOOK: Always end with what happens next (next match, series status, tournament implications).
+5. FORMAT: Create a punchy sports headline and a 2-sentence summary. Body: 3-5 paragraphs separated by "NEWPARA".
+
+Return ONLY a JSON object:
+{{
+  "thought_process": "Brief analysis of the key sports facts and the reporting plan.",
+  "headline": "Punchy sports headline",
+  "summary": "2-sentence summary with the key result or development.",
+  "body": "Lead paragraph NEWPARA Details/stats paragraph NEWPARA ... NEWPARA What-next paragraph",
+  "tags": ["tag1", "tag2", "tag3", "tag4", "tag5"]
+}}
+
+Article Category: {category}
+Original Title: {title}
+Original Content: {content}
+"""
+
+_PROMPT_AUTO = """Rewrite the provided automotive article into a clean, informative auto-industry piece for a professional Indian news platform.
+
+EDITORIAL REQUIREMENTS:
+1. AUTO JOURNALISM STYLE: Fact-forward and consumer-friendly. Lead with the most important spec, price, or policy development.
+2. VEHICLE LAUNCHES / REVIEWS: Key specs, price, segment positioning, what it means for buyers.
+3. INDUSTRY / POLICY NEWS: Report factually — regulations, sales data, EV transition news.
+4. OUTLOOK: End with launch dates, market implications, or availability.
+5. FORMAT: Create a clear, informative headline and a 2-sentence summary. Body: 3-5 paragraphs separated by "NEWPARA".
+
+Return ONLY a JSON object:
+{{
+  "thought_process": "Brief analysis of the auto content and the reporting plan.",
+  "headline": "Informative auto headline",
+  "summary": "2-sentence summary with the key spec, launch, or development.",
+  "body": "Lead paragraph NEWPARA Details paragraph NEWPARA ... NEWPARA Outlook paragraph",
+  "tags": ["tag1", "tag2", "tag3", "tag4", "tag5"]
+}}
+
+Article Category: {category}
+Original Title: {title}
+Original Content: {content}
+"""
+
+
+def get_rewrite_prompt(title: str, content: str, category: str) -> str:
+    """Returns the appropriate rewrite prompt for the given article category."""
+    cat = category.strip().lower()
+    if cat == "cinema":
+        template = _PROMPT_CINEMA
+    elif cat == "sports":
+        template = _PROMPT_SPORTS
+    elif cat == "auto":
+        template = _PROMPT_AUTO
+    else:
+        # india, international, business — hard news style
+        template = _PROMPT_HARD_NEWS
+    return template.format(title=title, content=content, category=category)
 
 
 # ─── Logging Setup ───────────────────────────────────────────────────────────
@@ -354,27 +433,103 @@ def fetch_rss_feed() -> list[dict]:
                 except Exception:
                     root_section = ""
 
-                # Real trash paths identified directly from the live RSS feeds
-                # Filtering down to pure news (excluding health, offbeat, features, opinions, etc.)
+                # ── Layer 1: Root-section / path-based blocklist ──────────
+                # Verified against live RSS feeds from TOI, NDTV, The Hindu.
                 live_trash_sections = {
+                    # Lifestyle / soft content
                     "health", "offbeat", "feature", "opinion",
-                    "education", "lifestyle", "astrology"
+                    "education", "lifestyle", "astrology", "life-and-style",
+                    "sci-tech",
+                    # Non-article formats
+                    "tag", "topic", "author", "search", "gallery",
+                    "videos", "video", "podcast", "quiz", "crossword",
+                    "shorts", "photostory", "photostories", "liveblog",
+                    "visual-story", "data",
+                    # Opinion / editorial
+                    "op-ed", "editorial", "columns", "lead", "letters",
+                    "interview", "comment",
                 }
-                
-                if not article_url or root_section in live_trash_sections or "/health/" in article_url.lower() or "/offbeat/" in article_url.lower():
+
+                # ── Layer 2: URL-fragment blocklist ──────────────────────
+                # Catches sub-paths the root-section check misses.
+                _trash_url_fragments = (
+                    "/health/", "/offbeat/", "/tag/", "/topic/", "/author/",
+                    "/search/", "/gallery/", "/videos/", "/video/", "/podcast/",
+                    "/quiz/", "/slideshows/", "/photogallery/", "/photostory/",
+                    "/shorts/", "/liveblog/", "/live-blog/", "/live-updates/",
+                    "/visual-story/", "/data/", "/opinion/", "/op-ed/",
+                    "/editorial/", "/life-and-style/", "/sci-tech/",
+                    "/etimes/",   # TOI's entertainment sub-domain paths
+                    "/astrology/",
+                    # NDTV-specific non-news sections
+                    "/education/", "/artificial-intelligence/",
+                    # TOI-specific sections that slip through on world feed
+                    "/science/", "/games/", "/toi-plus/",
+                    # Times Now clickbait & collection pages
+                    "/top-stories/",
+                )
+
+                if not article_url or root_section in live_trash_sections or any(
+                    frag in article_url.lower() for frag in _trash_url_fragments
+                ):
+                    continue
+
+                # ── Layer 3: Title-level blocklist ───────────────────────
+                # Blocks well-known non-article patterns before any HTTP call.
+                # Verified against real feed titles from NDTV India, TOI World, The Hindu.
+                raw_title = entry.get("title", "").strip().lower()
+
+                _trash_title_prefixes = (
+                    # Daily filler content
+                    "quote of the day", "word of the day", "thought for the day",
+                    "hack of the day",
+                    # Horoscopes
+                    "horoscope", "today's horoscope", "daily horoscope",
+                    # Listicles
+                    "top 10", "top 5", "top 7", "top 15", "top 20", "top 25",
+                    "10 things", "5 things", "7 things", "8 things",
+                    # How-to / tips
+                    "how to", "tips to", "ways to", "reasons why",
+                    # Multimedia content
+                    "watch:", "watch |", "listen:", "video:",
+                    # Editorial / opinion
+                    "explainer:", "fact check:", "opinion:", "opinion |",
+                    "analysis:", "in-depth:",
+                    # Live blogs (caught at URL level too, belt-and-suspenders)
+                    "live updates:", "live updates |", "live:",
+                )
+
+                _trash_title_keywords = (
+                    # Paywalled content
+                    "exclusive:", "| exclusive", "- exclusive",
+                    "subscribe to read", "premium story", "subscribers only",
+                    # Education/exam results (heavy NDTV India spam)
+                    "result 2026", "result 2025", "admit card", "answer key",
+                    "registration extended", "application form", "syllabus",
+                    "exam date", "merit list", "cut off marks",
+                    # Redeem codes / gaming
+                    "redeem codes", "redeem code", "promo codes",
+                    "free fire", "genshin impact codes",
+                )
+
+                if any(raw_title.startswith(p) for p in _trash_title_prefixes):
+                    continue
+                if any(k in raw_title for k in _trash_title_keywords):
                     continue
 
                 # Use RSS feed's category as the initial value (Llama will refine)
                 article_category = category
 
-                # Extract image URL — TOI uses <enclosure> tag, Times Now might use content
+                # ── Image Extraction ────────────────────────────────────
+                # Priority: media:content (The Hindu / NDTV) > enclosure (TOI)
+                # > content HTML img (Times Now) > none
                 image_url = ""
                 if hasattr(entry, "media_content") and entry.media_content:
                     image_url = entry.media_content[0].get("url", "")
                 elif hasattr(entry, "enclosures") and entry.enclosures:
                     image_url = entry.enclosures[0].get("href", "") or entry.enclosures[0].get("url", "")
-                
-                # Fallback for Times Now which stores image in content
+
+                # Fallback: Times Now embeds image in <content> HTML
                 if not image_url and hasattr(entry, "content") and entry.content:
                     content_html = entry.content[0].value
                     img_soup = BeautifulSoup(content_html, "html.parser")
@@ -382,11 +537,11 @@ def fetch_rss_feed() -> list[dict]:
                     if img_tag and img_tag.get("src"):
                         image_url = img_tag["src"]
 
-                # TOI description contains HTML img tags — strip them to get text
+                # ── Description Cleanup ─────────────────────────────────
+                # TOI description contains HTML img tags — strip to get clean text.
                 raw_desc = entry.get("description", "")
                 if raw_desc:
                     desc_soup = BeautifulSoup(raw_desc, "html.parser")
-                    # Remove img tags and links, keep only text
                     for img_tag in desc_soup.find_all("img"):
                         img_tag.decompose()
                     for a_tag in desc_soup.find_all("a"):
@@ -461,12 +616,39 @@ def scrape_article_content(url: str) -> Optional[str]:
                                    "iframe", "noscript", "form"]):
             tag.decompose()
 
-        # Remove ad containers and social sharing blocks
-        for cls in ["ads", "social-share", "also-read", "story__also-read",
-                     "related-news", "comments", "newsletter", "trending",
-                     "right-sidebar", "sidebar"]:
+        # Remove ad containers, social sharing blocks, and cross-reference sections.
+        # This is the PRIMARY defence against "Also Read" / "Related Articles" noise
+        # from The Hindu and TOI leaking into scraped content.
+        _noise_classes = [
+            "ads", "social-share", "also-read", "story__also-read",
+            "related-news", "related-articles", "comments", "newsletter",
+            "trending", "right-sidebar", "sidebar", "read-more",
+            "also-read-section", "inline-related", "suggested-stories",
+            "you-may-like", "more-stories", "topic-tags", "author-info",
+            "editorspick", "editors-pick", "most-read", "popular-stories",
+        ]
+        for cls in _noise_classes:
             for el in soup.find_all(class_=lambda c: c and cls in c.lower() if c else False):
                 el.decompose()
+
+        # Also strip elements whose text STARTS with a cross-reference signal
+        _ref_prefixes = (
+            "also read", "read also", "read more", "also see",
+            "related:", "more on:", "watch:", "listen:",
+        )
+
+        def _clean_paragraph(text: str) -> Optional[str]:
+            """Return None if a paragraph is cross-reference noise; else return cleaned text."""
+            t = text.strip()
+            tl = t.lower()
+            # Drop paragraphs that start with a cross-reference signal
+            if any(tl.startswith(p) for p in _ref_prefixes):
+                return None
+            # Drop very short paragraphs that look like bare article titles
+            # (e.g. the inline "Also Read: Title Here" pattern after stripping the label)
+            if len(t) < 30 and t.endswith(("?", "!", "…")) is False and t.isupper():
+                return None
+            return t
 
         # Strategy 1: Source-specific article content containers
         content_selectors = [
@@ -498,23 +680,26 @@ def scrape_article_content(url: str) -> Optional[str]:
                 container = soup.find(selector)
 
             if container:
-                # Get all paragraph text
                 paragraphs = container.find_all("p")
                 if paragraphs:
-                    content_text = "\n\n".join(
-                        p.get_text(strip=True) for p in paragraphs
-                        if p.get_text(strip=True) and len(p.get_text(strip=True)) > 20
-                    )
+                    cleaned = []
+                    for p in paragraphs:
+                        t = _clean_paragraph(p.get_text(strip=True))
+                        if t and len(t) > 20:
+                            cleaned.append(t)
+                    content_text = "\n\n".join(cleaned)
                     if content_text:
                         break
 
         # Strategy 2: Fallback — grab all substantial paragraphs from body
         if not content_text or len(content_text) < 100:
             all_paragraphs = soup.find_all("p")
-            content_text = "\n\n".join(
-                p.get_text(strip=True) for p in all_paragraphs
-                if p.get_text(strip=True) and len(p.get_text(strip=True)) > 40
-            )
+            cleaned = []
+            for p in all_paragraphs:
+                t = _clean_paragraph(p.get_text(strip=True))
+                if t and len(t) > 40:
+                    cleaned.append(t)
+            content_text = "\n\n".join(cleaned)
 
         if content_text and len(content_text) > 100:
             if len(content_text) > 5000:
@@ -547,7 +732,7 @@ CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 # NVIDIA NIM (Tier 2 Fallback — between Cerebras and Mistral)
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_REWRITE_MODEL = "meta/llama-3.3-70b-instruct"
-NVIDIA_FILTER_MODEL = "meta/llama-3.1-8b-instruct"
+NVIDIA_FILTER_MODEL = "meta/llama-4-maverick-17b-128e-instruct"
 
 # Mistral AI (Tier 3 Fallback — between NVIDIA and OpenRouter)
 MISTRAL_BASE_URL = "https://api.mistral.ai/v1"
@@ -712,7 +897,7 @@ class OpenRouterMiddle:
 
     def rewrite(self, title: str, content: str, category: str) -> Optional[dict]:
         """Rewrite article using OpenRouter with retries per model and reasoning support."""
-        prompt = AI_REWRITE_PROMPT.format(title=title, content=content, category=category)
+        prompt = get_rewrite_prompt(title, content, category)
         
         for model_id in OPENROUTER_MODELS:
             # More retries for the main router, fewer for specific models
@@ -825,7 +1010,7 @@ class NvidiaFallback:
 
     def rewrite(self, title: str, content: str, category: str) -> Optional[dict]:
         """Rewrite article using Llama 3.1 Nemotron 70B on NVIDIA NIM."""
-        prompt = AI_REWRITE_PROMPT.format(title=title, content=content, category=category)
+        prompt = get_rewrite_prompt(title, content, category)
         for attempt in range(1, 3):
             client, key_idx = self.manager.get_client()
             if not client: break
@@ -909,7 +1094,7 @@ class MistralFallback:
 
     def rewrite(self, title: str, content: str, category: str) -> Optional[dict]:
         """Rewrite article using Mistral Large."""
-        prompt = AI_REWRITE_PROMPT.format(title=title, content=content, category=category)
+        prompt = get_rewrite_prompt(title, content, category)
         for attempt in range(1, 3):
             client, key_idx = self.manager.get_client()
             if not client: break
@@ -999,7 +1184,7 @@ class GeminiBackup:
 
     def rewrite(self, title: str, content: str, category: str) -> Optional[dict]:
         """Rewrite article using Gemini 2.5 Pro with retries for 503."""
-        prompt = f"{SYSTEM_PROMPT}\n\n{AI_REWRITE_PROMPT.format(title=title, content=content, category=category)}"
+        prompt = f"{SYSTEM_PROMPT}\n\n{get_rewrite_prompt(title, content, category)}"
         for attempt in range(1, 4):
             client, key_idx = self.manager.get_client()
             if not client: break
@@ -1190,7 +1375,7 @@ def rewrite_article(key_manager: 'AIKeyManager', title: str, content: str, categ
     Send article to Cerebras for analysis and rewriting.
     Falls back to NVIDIA, then Mistral, then OpenRouter Qwen-235B/Free, then Gemini 2.5 Pro if all fail.
     """
-    prompt = AI_REWRITE_PROMPT.format(title=title, content=content, category=category)
+    prompt = get_rewrite_prompt(title, content, category)
 
     cerebras_failed = False
     
@@ -1319,6 +1504,102 @@ def rewrite_article(key_manager: 'AIKeyManager', title: str, content: str, categ
         return gemini.rewrite(title, content, category)
 
     return None
+
+# ─── Rewrite Quality Validator ──────────────────────────────────────────────
+
+# Phrases the AI uses when it refuses to rewrite non-news content.
+# These must NEVER reach the published articles table.
+_NO_NEWS_HEADLINE_PATTERNS = [
+    "no news",
+    "no event",
+    "not a news",
+    "not news",
+    "no actionable",
+    "no reportable",
+    "no verifiable",
+    "cannot report",
+    "unable to report",
+    "no article",
+    "no content",
+    "insufficient content",
+    "content unavailable",
+    "article unavailable",
+    "placeholder",
+    "error:",
+]
+
+_NO_NEWS_BODY_PATTERNS = [
+    "does not contain a reportable news event",
+    "no reportable news",
+    "no verifiable news event",
+    "no factual occurrences",
+    "there is no news",
+    "not a reportable",
+    "not contain any news",
+    "this is not a news",
+    "provided text does not",
+    "source text does not",
+    "content provided does not",
+    "insufficient information to write",
+    "cannot write a news article",
+    "unable to write",
+    "paywall",
+    "subscribe to read",
+    "subscribers only",
+]
+
+# Minimum real body length — anything shorter is almost certainly a refusal or
+# a thin paywall teaser that slipped through.
+_MIN_BODY_CHARS = 200
+
+
+def _is_valid_rewrite(rewritten: dict) -> bool:
+    """
+    Returns False if the AI output is:
+    - A 'No News' refusal
+    - A suspiciously short / thin body (paywall teaser or empty fallback)
+    - Poisoned with cross-reference noise ('Also Read', 'Related:' etc.)
+    """
+    headline = rewritten.get("headline", "").strip()
+    summary  = rewritten.get("summary",  "").strip()
+    body     = rewritten.get("body",     "").strip()
+
+    hl_lower  = headline.lower()
+    sum_lower = summary.lower()
+    body_lower = body.lower()
+
+    # ── 1. AI refusal patterns ──
+    for pattern in _NO_NEWS_HEADLINE_PATTERNS:
+        if pattern in hl_lower:
+            return False
+
+    for pattern in _NO_NEWS_BODY_PATTERNS:
+        if pattern in sum_lower or pattern in body_lower:
+            return False
+
+    # ── 2. Minimum length sanity checks ──
+    if len(hl_lower) < 10:
+        return False  # Headline too short — blank or garbage
+    if len(body) < _MIN_BODY_CHARS:
+        return False  # Body too short — thin/paywall teaser or empty response
+
+    # ── 3. Cross-reference noise check ──
+    # If the body is mostly "Also Read:" / "Related:" lines, the AI was fed junk
+    _noise_prefixes = (
+        "also read", "read also", "read more", "related:",
+        "more on:", "watch:", "listen:", "you may also like",
+    )
+    body_lines = [ln.strip().lower() for ln in body.split("\n") if ln.strip()]
+    if body_lines:
+        noise_count = sum(
+            1 for ln in body_lines
+            if any(ln.startswith(p) for p in _noise_prefixes)
+        )
+        if noise_count / len(body_lines) > 0.4:  # >40% noise lines → reject
+            return False
+
+    return True
+
 
 # ─── Supabase Writer ─────────────────────────────────────────────────────────
 
@@ -1608,12 +1889,23 @@ def process_cycle(key_manager: 'AIKeyManager', sb: Client, tracker: URLTracker, 
         
         if not rewritten:
             log.warning("   [SKIP] Rewrite failed. Breaking cycle to protect Qwen rate limits.")
-            break 
+            break
 
-        # Step 4: Save to Supabase
+        # Step 4: Validate the rewrite — reject AI 'No News' refusals
+        if not _is_valid_rewrite(rewritten):
+            log.warning(f"   [REJECT] AI returned a 'No News' refusal for: {article['title'][:70]}")
+            log.warning(f"   [REJECT] Headline was: '{rewritten.get('headline', '')[:80]}'")
+            save_ignored_article_supabase(sb, article, {"thought_process": f"[AI-REFUSAL] {rewritten.get('summary', '')}" })
+            tracker.mark_visited(article["url"])
+            tracker.increment_daily_count()
+            processed += 1
+            log.info(f"   [DONE] AI refusal logged to ignored_articles. Ending cycle.")
+            break
+
+        # Step 5: Save to Supabase
         save_article_supabase(sb, article, rewritten, r2_manager=r2_manager)
 
-        # Step 5: Track and End Cycle
+        # Step 6: Track and End Cycle
         tracker.mark_visited(article["url"])
         tracker.increment_daily_count()
         processed += 1
